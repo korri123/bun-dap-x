@@ -2,7 +2,78 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Subprocess } from "bun";
 import { DapSessionManager, requireBunAdapter } from "./support/dap-session.ts";
+
+interface InspectNotifyServer {
+	url: string;
+	wait(timeoutMs: number): Promise<void>;
+	close(): void;
+}
+
+function getFreeTcpPort(): number {
+	const server = Bun.listen({
+		hostname: "127.0.0.1",
+		port: 0,
+		socket: {
+			open() {},
+			data() {},
+			close() {},
+			error() {},
+		},
+	});
+	const port = server.port;
+	server.stop(true);
+	return port;
+}
+
+function createInspectNotifyServer(): InspectNotifyServer {
+	const received = Promise.withResolvers<void>();
+	let settled = false;
+	const settle = (): void => {
+		if (settled) return;
+		settled = true;
+		received.resolve();
+	};
+	const fail = (error: Error): void => {
+		if (settled) return;
+		settled = true;
+		received.reject(error);
+	};
+	const server = Bun.listen({
+		hostname: "127.0.0.1",
+		port: 0,
+		socket: {
+			open(socket) {
+				settle();
+				socket.end();
+			},
+			data(socket) {
+				settle();
+				socket.end();
+			},
+			close() {},
+			error(_socket, error) {
+				fail(error instanceof Error ? error : new Error(String(error)));
+			},
+		},
+	});
+	return {
+		url: `tcp://127.0.0.1:${server.port}`,
+		async wait(timeoutMs: number): Promise<void> {
+			const timeout = Promise.withResolvers<never>();
+			const timer = setTimeout(() => timeout.reject(new Error("Timed out waiting for Bun inspector notification")), timeoutMs);
+			try {
+				await Promise.race([received.promise, timeout.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		},
+		close() {
+			server.stop(true);
+		},
+	};
+}
 
 describe("bundled Bun DAP adapter", () => {
 	it("launches Bun and stops on a pending source breakpoint before user code runs", async () => {
@@ -33,6 +104,72 @@ describe("bundled Bun DAP adapter", () => {
 			expect(evaluated.evaluation?.result).toBe("41");
 		} finally {
 			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("attaches to a Bun inspector target and evaluates locals at a breakpoint", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-attach-"));
+		const notify = createInspectNotifyServer();
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-attach-${Bun.randomUUIDv7()}`;
+		let target: Subprocess<"ignore", "ignore", "ignore"> | undefined;
+		let adapterTerminated = false;
+		try {
+			const program = path.join(cwd, "attach.ts");
+			const breakpointLine = 2;
+			await Bun.write(
+				program,
+				[
+					"function compute(localValue: number) {",
+					"  console.log('attach local', localValue);",
+					"  return localValue;",
+					"}",
+					"compute(42);",
+					"await new Promise(() => {});",
+					"",
+				].join("\n"),
+			);
+			const realProgram = await fs.realpath(program);
+			const inspectorUrl = `ws://127.0.0.1:${getFreeTcpPort()}/${Bun.randomUUIDv7()}`;
+			target = Bun.spawn({
+				cmd: [process.execPath, program],
+				cwd,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+				env: {
+					...Bun.env,
+					BUN_INSPECT: `${inspectorUrl}?break=1`,
+					BUN_INSPECT_NOTIFY: notify.url,
+					BUN_QUIET_DEBUG_LOGS: "1",
+					BUN_DEBUG_QUIET_LOGS: "1",
+					FORCE_COLOR: "0",
+				},
+				windowsHide: true,
+			});
+			const notifyResult = await Promise.race([notify.wait(10_000).then(() => undefined), target.exited.then((exitCode) => ({ exitCode }))]);
+			if (notifyResult) throw new Error(`Bun attach target exited before inspector notification (exit code ${notifyResult.exitCode})`);
+
+			await manager.setBreakpoint(program, breakpointLine, undefined, undefined, 10_000, { ownerId });
+			const attached = await manager.attach({ ownerId, adapter: requireBunAdapter(cwd), program, cwd, url: inspectorUrl }, undefined, 30_000);
+			expect(attached.adapter).toBe("bun");
+			expect(attached.status).toBe("stopped");
+			expect(attached.breakpointCount).toBe(1);
+			expect(attached.source?.path).toBe(realProgram);
+			expect(attached.line).toBe(breakpointLine);
+
+			const evaluated = await manager.evaluate("localValue", "repl", undefined, undefined, 10_000, { ownerId });
+			expect(evaluated.evaluation?.result).toBe("42");
+
+			const terminated = await manager.terminate(undefined, 10_000, { ownerId });
+			adapterTerminated = true;
+			expect(terminated.status).toBe("terminated");
+		} finally {
+			notify.close();
+			if (!adapterTerminated) await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			if (target?.exitCode === null) target.kill("SIGTERM");
+			await target?.exited.catch(() => undefined);
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	}, 45_000);

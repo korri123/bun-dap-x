@@ -2,6 +2,33 @@
 	"name": "bun-dap-x",
 	"version": "0.1.0",
 	"description": "Standalone Debug Adapter Protocol server for Bun Inspector.",
+	"keywords": [
+		"bun",
+		"debug-adapter-protocol",
+		"dap",
+		"debugger",
+		"bun-inspector",
+		"vscode",
+		"nvim-dap"
+	],
+	"author": "korri123",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/korri123/bun-dap-x.git"
+	},
+	"bugs": {
+		"url": "https://github.com/korri123/bun-dap-x/issues"
+	},
+	"homepage": "https://github.com/korri123/bun-dap-x#readme",
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"engines": {
+		"bun": ">=1.3.14"
+	},
 	"type": "module",
 	"module": "./src/index.ts",
 	"bin": {

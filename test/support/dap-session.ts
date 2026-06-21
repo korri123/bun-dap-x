@@ -16,6 +16,7 @@ interface TestAdapter {
 	command: string[];
 	cwd: string;
 	launchDefaults: Record<string, unknown>;
+	attachDefaults: Record<string, unknown>;
 	name: string;
 }
 
@@ -84,6 +85,19 @@ interface DapLaunchOptions {
 	extraLaunchArguments?: Record<string, unknown>;
 }
 
+interface DapAttachOptions {
+	ownerId: string;
+	adapter: TestAdapter;
+	program: string;
+	cwd: string;
+	url?: string;
+	inspectorUrl?: string;
+	host?: string;
+	port?: number;
+	path?: string;
+	extraAttachArguments?: Record<string, unknown>;
+}
+
 function toError(value: unknown): Error {
 	return value instanceof Error ? value : new Error(String(value));
 }
@@ -111,6 +125,7 @@ export function requireBunAdapter(cwd: string): TestAdapter {
 		cwd: path.resolve(import.meta.dir, "..", ".."),
 		command: [process.execPath, path.resolve(import.meta.dir, "..", "..", "src", "cli.ts")],
 		launchDefaults: { runtime: process.execPath, cwd },
+		attachDefaults: { cwd },
 	};
 }
 
@@ -306,6 +321,48 @@ export class DapSessionManager {
 					program: options.program,
 					cwd: options.cwd,
 					args: options.args,
+				},
+				timeoutMs,
+			);
+			await client.waitForEvent(["initialized"], timeoutMs);
+			await this.#applyPendingBreakpoints(session, timeoutMs);
+			await client.request("configurationDone", {}, timeoutMs);
+			session.status = "running";
+			await this.#waitForStopOrTermination(session, Math.min(timeoutMs, 10_000)).catch(() => undefined);
+			return this.#summary(session);
+		} catch (error) {
+			await client.close().catch(() => undefined);
+			this.#session = undefined;
+			throw toError(error);
+		}
+	}
+
+	async attach(options: DapAttachOptions, _signal?: AbortSignal, timeoutMs = 30_000): Promise<SessionSummary> {
+		const client = DapClient.spawn(options.adapter);
+		const session: SessionState = {
+			client,
+			adapter: options.adapter,
+			cwd: options.cwd,
+			program: options.program,
+			ownerId: options.ownerId,
+			status: "configuring",
+			breakpoints: new Map(),
+		};
+		this.#session = session;
+		try {
+			session.capabilities = await client.request<DapCapabilities>("initialize", { adapterID: "bun" }, timeoutMs);
+			await client.request(
+				"attach",
+				{
+					...options.adapter.attachDefaults,
+					...(options.extraAttachArguments ?? {}),
+					program: options.program,
+					cwd: options.cwd,
+					url: options.url,
+					inspectorUrl: options.inspectorUrl,
+					host: options.host,
+					port: options.port,
+					path: options.path,
 				},
 				timeoutMs,
 			);
