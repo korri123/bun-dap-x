@@ -1,0 +1,34 @@
+{
+	"name": "bun-dap-x",
+	"version": "0.1.0",
+	"description": "Standalone Debug Adapter Protocol server for Bun Inspector.",
+	"type": "module",
+	"module": "./src/index.ts",
+	"bin": {
+		"bun-dap-x": "./src/cli.ts"
+	},
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"start": "bun src/cli.ts",
+		"check": "biome check . && bun run typecheck && bun run knip && bun run jscpd",
+		"format": "biome format --write .",
+		"test": "bun test test",
+		"typecheck": "tsgo --noEmit",
+		"knip": "knip",
+		"jscpd": "jscpd src"
+	},
+	"dependencies": {
+		"source-map-js": "^1.2.1"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.4.14",
+		"@types/bun": "1.3.13",
+		"@types/node": "25.6.1",
+		"@typescript/native-preview": "7.0.0-dev.20260421.2",
+		"jscpd": "4.2.4",
+		"knip": "6.12.1",
+		"typescript": "6.0.3"
+	}
+}

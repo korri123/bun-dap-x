@@ -1,0 +1,11 @@
+{
+	"threshold": 0,
+	"minLines": 5,
+	"minTokens": 50,
+	"maxLines": 10000,
+	"maxSize": "1mb",
+	"gitignore": true,
+	"ignore": ["**/*.test.*", "**/*.spec.*", "**/*.json", "src/ui/icons/**"],
+	"reporters": ["ai"],
+	"exitCode": 1
+}

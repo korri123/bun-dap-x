@@ -1,0 +1,31 @@
+{
+	"compilerOptions": {
+		"lib": ["DOM", "ES2022"],
+		"target": "ES2022",
+		"noEmit": true,
+		"skipLibCheck": true,
+		"useDefineForClassFields": true,
+
+		/* modules */
+		"module": "ESNext",
+		"moduleDetection": "force",
+		"moduleResolution": "bundler",
+		"verbatimModuleSyntax": true,
+		"resolveJsonModule": true,
+		"allowImportingTsExtensions": true,
+		"noUncheckedSideEffectImports": true,
+
+		/* type checking */
+		"strict": true,
+		"forceConsistentCasingInFileNames": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		"allowUnusedLabels": false,
+		"allowUnreachableCode": false,
+		"noImplicitOverride": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"types": ["bun", "node"]
+	},
+	"include": ["src", "test"]
+}
