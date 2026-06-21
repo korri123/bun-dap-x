@@ -22,7 +22,7 @@
 	},
 	"homepage": "https://github.com/korri123/bun-dap-x#readme",
 	"files": [
-		"bin",
+		"dist",
 		"src",
 		"README.md",
 		"CHANGELOG.md",
@@ -34,19 +34,21 @@
 	"type": "module",
 	"module": "./src/index.ts",
 	"bin": {
-		"bun-dap-x": "./bin/bun-dap-x"
+		"bun-dap-x": "./dist/bun-dap-x"
 	},
 	"exports": {
 		".": "./src/index.ts"
 	},
 	"scripts": {
+		"build": "bun build src/cli.ts --target=bun --outfile=dist/bun-dap-x && chmod +x dist/bun-dap-x",
 		"start": "bun src/cli.ts",
 		"check": "biome check . && bun run typecheck && bun run knip && bun run jscpd",
 		"format": "biome format --write .",
-		"test": "bun test test",
+		"test": "bun run build && bun test test",
 		"typecheck": "tsgo --noEmit",
 		"knip": "knip",
-		"jscpd": "jscpd src"
+		"jscpd": "jscpd src",
+		"prepack": "bun run build"
 	},
 	"dependencies": {
 		"source-map-js": "^1.2.1"

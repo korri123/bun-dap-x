@@ -54,6 +54,7 @@ Supported launch arguments:
 - `env`: environment overrides.
 - `strictEnv`: when `true`, use only `env`; otherwise merge with the adapter environment.
 - `stopOnEntry`: when `true`, keep Bun's initial inspector pause.
+- `disableTestTimeout`: when omitted or `true`, `bun test` launches get `--timeout=0` unless `args` or `runtimeArgs` already contain `--timeout`; set `false` to preserve Bun's default timeout.
 
 For `attach`, start Bun with the inspector enabled and attach to the WebSocket URL that Bun prints:
 
@@ -70,7 +71,7 @@ bun --inspect=127.0.0.1:6499 ./src/index.ts
 }
 ```
 
-Attach also accepts `inspectorUrl`, or `host`, `port`, and `path` fields. The default host is `127.0.0.1`; the default port is `6499`. `path` is still required unless you pass a full `url`/`inspectorUrl`, because Bun's Inspector HTTP endpoint does not expose the per-process WebSocket path.
+Attach also accepts `inspectorUrl`, or `host`, `port`, and `path` fields. The default host is `127.0.0.1`; the default port is `6499`. `path` is still required unless you pass a full `url`/`inspectorUrl`, because Bun's Inspector HTTP endpoint does not expose the per-process WebSocket path. For `*.test.*` and `*.spec.*` targets, attach disables Bun's test timeout before resume; set `disableTestTimeout` to `false` to opt out, or to `true` for nonstandard Bun test filenames.
 
 ## VS Code
 

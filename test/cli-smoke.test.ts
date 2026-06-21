@@ -77,10 +77,10 @@ function isEvent(message: DapMessage, event: string): message is DapEventMessage
 	return message.type === "event" && message.event === event;
 }
 
-test("src/cli.ts handles stdio DAP initialize and terminate", async () => {
+test("package bin handles stdio DAP initialize and terminate", async () => {
 	const repoRoot = path.resolve(import.meta.dir, "..");
 	const child = Bun.spawn({
-		cmd: [process.execPath, path.join(repoRoot, "src", "cli.ts")],
+		cmd: [path.join(repoRoot, "dist", "bun-dap-x")],
 		cwd: repoRoot,
 		stdin: "pipe",
 		stdout: "pipe",

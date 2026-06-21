@@ -71,6 +71,13 @@ interface InspectorCallArgument {
 	objectId?: string;
 }
 
+interface InspectorEvaluateResult {
+	result?: InspectorRemoteObject;
+	exceptionDetails?: unknown;
+}
+
+type TestTimeoutPolicy = "off" | "auto" | "required";
+
 interface InspectorScope {
 	type: string;
 	name?: string;
@@ -214,6 +221,28 @@ function stringArg(value: unknown): string | undefined {
 function stringArrayArg(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function isBunExecutablePath(value: string): boolean {
+	const name = path.basename(value).toLowerCase();
+	return name === "bun" || name === "bun.exe";
+}
+
+function hasBunTestTimeoutArg(args: readonly string[]): boolean {
+	return args.some((arg) => arg === "--timeout" || arg.startsWith("--timeout="));
+}
+
+function withDebuggerTestTimeout(args: readonly string[], disableTestTimeout: boolean): string[] {
+	if (!disableTestTimeout || args[0] !== "test" || hasBunTestTimeoutArg(args)) return [...args];
+	return ["test", "--timeout=0", ...args.slice(1)];
+}
+
+function booleanArg(value: unknown): boolean | undefined {
+	return typeof value === "boolean" ? value : undefined;
+}
+
+function isLikelyBunTestPath(value: string | undefined): boolean {
+	return value !== undefined && /(?:^|[.-])(?:test|spec)\.[cm]?[jt]sx?$/i.test(path.basename(value));
 }
 
 function numberArg(value: unknown): number | undefined {
@@ -997,6 +1026,7 @@ class BunDebugAdapter {
 	#exceptionPauseState: InspectorPauseOnExceptionsState = "none";
 	#suppressInitialPause = false;
 	#deferredInitialPause: unknown;
+	#testTimeoutPolicy: TestTimeoutPolicy = "auto";
 
 	async run(): Promise<void> {
 		process.on("SIGTERM", () => this.dispose());
@@ -1192,9 +1222,17 @@ class BunDebugAdapter {
 		if (!program) throw new Error("Bun launch requires program");
 		const cwd = stringArg(args.cwd) ?? process.cwd();
 		this.#rememberFunctionSourcePath(program, cwd);
-		const runtime = stringArg(args.runtime) ?? stringArg(args.runtimeExecutable) ?? "bun";
+		this.#testTimeoutPolicy = "off";
+		const runtimeArg = stringArg(args.runtime) ?? stringArg(args.runtimeExecutable);
 		const runtimeArgs = stringArrayArg(args.runtimeArgs);
-		const processArgs = [...runtimeArgs, program, ...stringArrayArg(args.args)];
+		const programArgs = stringArrayArg(args.args);
+		const programIsRuntime = runtimeArg === undefined && isBunExecutablePath(program);
+		const runtime = programIsRuntime ? program : (runtimeArg ?? "bun");
+		const disableTestTimeout = booleanArg(args.disableTestTimeout) ?? true;
+		const processArgs = withDebuggerTestTimeout(
+			programIsRuntime ? [...runtimeArgs, ...programArgs] : [...runtimeArgs, program, ...programArgs],
+			disableTestTimeout,
+		);
 		const env = mergeEnv(readJsonEnv(args.env), args.strictEnv === true);
 		const inspectorPort = await getFreeTcpPort();
 		const inspectorUrl = `ws://127.0.0.1:${inspectorPort}/${crypto.randomUUID()}`;
@@ -1242,7 +1280,10 @@ class BunDebugAdapter {
 	}
 
 	async #attach(args: DapBody): Promise<void> {
-		this.#rememberFunctionSourcePath(stringArg(args.program), stringArg(args.cwd) ?? process.cwd());
+		const program = stringArg(args.program);
+		this.#rememberFunctionSourcePath(program, stringArg(args.cwd) ?? process.cwd());
+		const disableTestTimeout = booleanArg(args.disableTestTimeout);
+		this.#testTimeoutPolicy = disableTestTimeout === true ? "required" : disableTestTimeout === false ? "off" : isLikelyBunTestPath(program) ? "auto" : "off";
 		const attachUrl = stringArg(args.url) ?? stringArg(args.inspectorUrl) ?? this.#buildAttachUrl(args);
 		await this.#connectInspector(attachUrl);
 	}
@@ -1285,12 +1326,38 @@ class BunDebugAdapter {
 		this.#configurationDone = true;
 		const inspector = this.#requiredInspector();
 		await inspector.send("Debugger.setBreakpointsActive", { active: true });
+		await this.#disableBunTestTimeoutBeforeResume(inspector);
 		await inspector.send("Inspector.initialized");
 		await this.#rebindBreakpointsForLoadedScripts();
 		if (this.#suppressInitialPause && this.#deferredInitialPause !== undefined) {
 			this.#deferredInitialPause = undefined;
 			await inspector.send("Debugger.resume").catch(() => undefined);
 		}
+	}
+
+	async #disableBunTestTimeoutBeforeResume(inspector: InspectorConnection): Promise<void> {
+		if (this.#testTimeoutPolicy === "off") return;
+		if (this.#testTimeoutPolicy === "auto" && !(await this.#targetMainLooksLikeBunTest(inspector))) return;
+		const response = await inspector.send<InspectorEvaluateResult>("Runtime.evaluate", {
+			expression: "import('bun:test').then((module) => { module.jest.setTimeout(0); return true; })",
+			objectGroup: "bun-dap-x",
+			awaitPromise: true,
+			returnByValue: true,
+			silent: true,
+		});
+		if (response.exceptionDetails) throw new Error("Failed to disable Bun test timeout through bun:test");
+	}
+
+	async #targetMainLooksLikeBunTest(inspector: InspectorConnection): Promise<boolean> {
+		const response = await inspector.send<InspectorEvaluateResult>("Runtime.evaluate", {
+			expression: "typeof Bun === 'object' && typeof Bun.main === 'string' ? Bun.main : ''",
+			objectGroup: "bun-dap-x",
+			returnByValue: true,
+			silent: true,
+		});
+		if (response.exceptionDetails) return false;
+		const main = response.result?.value;
+		return isLikelyBunTestPath(typeof main === "string" ? main : undefined);
 	}
 
 	async #setBreakpoints(args: DapBody): Promise<{ breakpoints: DapBreakpoint[] }> {

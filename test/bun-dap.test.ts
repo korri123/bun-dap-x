@@ -174,6 +174,283 @@ describe("standalone Bun DAP adapter", () => {
 		}
 	}, 45_000);
 
+	it("launches a Bun executable program with test arguments and stops in imported test code", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-test-launch-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-test-launch-${Bun.randomUUIDv7()}`;
+		try {
+			const source = path.join(cwd, "math.ts");
+			const testFile = path.join(cwd, "math.test.ts");
+			await Bun.write(
+				source,
+				["export function addTwice(value: number): number {", "  const doubled = value * 2;", "  return doubled + 1;", "}", ""].join("\n"),
+			);
+			await Bun.write(
+				testFile,
+				[
+					'import { expect, test } from "bun:test";',
+					'import { addTwice } from "./math.ts";',
+					'test("adds through imported code", () => {',
+					"  const result = addTwice(20);",
+					"  expect(result).toBe(41);",
+					"});",
+					"",
+				].join("\n"),
+			);
+			const realSource = await fs.realpath(source);
+			const adapter = requireBunAdapter(cwd);
+			adapter.launchDefaults = { cwd };
+			await manager.setBreakpoint(source, 2, undefined, undefined, 10_000, { ownerId });
+
+			const snapshot = await manager.launch({ ownerId, adapter, program: process.execPath, cwd, args: ["test", path.basename(testFile)] }, undefined, 30_000);
+
+			expect(snapshot.status).toBe("stopped");
+			expect(snapshot.source?.path).toBe(realSource);
+			expect(snapshot.line).toBe(2);
+
+			const stack = await manager.stackTrace(5, undefined, 10_000, { ownerId });
+			expect(stack.stackFrames[0]?.name).toBe("addTwice");
+			expect(stack.stackFrames[0]?.source?.path).toBe(realSource);
+			expect(stack.stackFrames[1]?.source?.path).toBe(await fs.realpath(testFile));
+
+			const evaluated = await manager.evaluate("value", "repl", stack.stackFrames[0]?.id, undefined, 10_000, { ownerId });
+			expect(evaluated.evaluation?.result).toBe("20");
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("disables Bun test timeouts for debug launch pauses", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-test-timeout-disabled-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-test-timeout-disabled-${Bun.randomUUIDv7()}`;
+		try {
+			const testFile = path.join(cwd, "timeout-disabled.test.ts");
+			await Bun.write(
+				testFile,
+				[
+					'import { expect, test } from "bun:test";',
+					'test("survives debugger pause", async () => {',
+					'  const marker = "before-pause";',
+					"  console.log(marker);",
+					"  await Bun.sleep(10);",
+					'  expect(marker).toBe("before-pause");',
+					"});",
+					"",
+				].join("\n"),
+			);
+			const adapter = requireBunAdapter(cwd);
+			adapter.launchDefaults = { cwd };
+			await manager.setBreakpoint(testFile, 4, undefined, undefined, 10_000, { ownerId });
+
+			const snapshot = await manager.launch(
+				{
+					ownerId,
+					adapter,
+					program: process.execPath,
+					cwd,
+					args: ["test", path.basename(testFile)],
+					extraLaunchArguments: { env: { FORCE_COLOR: "0" } },
+				},
+				undefined,
+				30_000,
+			);
+			expect(snapshot.status).toBe("stopped");
+			expect(snapshot.line).toBe(4);
+
+			await Bun.sleep(5_500);
+			const continued = await manager.continue(undefined, 20_000, { ownerId });
+			expect(continued.state).toBe("terminated");
+			const output = manager.getOutput(undefined, { ownerId }).output;
+			expect(output).toContain("1 pass");
+			expect(output).not.toContain("timed out after");
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("preserves explicit Bun test timeout arguments", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-test-timeout-explicit-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-test-timeout-explicit-${Bun.randomUUIDv7()}`;
+		try {
+			const testFile = path.join(cwd, "timeout-explicit.test.ts");
+			await Bun.write(
+				testFile,
+				[
+					'import { expect, test } from "bun:test";',
+					'test("keeps explicit timeout", async () => {',
+					"  await Bun.sleep(50);",
+					"  expect(true).toBe(true);",
+					"});",
+					"",
+				].join("\n"),
+			);
+			const adapter = requireBunAdapter(cwd);
+			adapter.launchDefaults = { cwd };
+
+			const snapshot = await manager.launch(
+				{
+					ownerId,
+					adapter,
+					program: process.execPath,
+					cwd,
+					args: ["test", "--timeout=10", path.basename(testFile)],
+					extraLaunchArguments: { env: { FORCE_COLOR: "0" } },
+				},
+				undefined,
+				30_000,
+			);
+			expect(snapshot.status).toBe("terminated");
+			expect(manager.getOutput(undefined, { ownerId }).output).toContain("timed out after");
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("keeps an attached Bun test session usable after stack, scopes, and evaluate", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-test-attach-"));
+		const notify = createInspectNotifyServer();
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-test-attach-${Bun.randomUUIDv7()}`;
+		let target: Subprocess<"ignore", "ignore", "ignore"> | undefined;
+		let adapterTerminated = false;
+		try {
+			const source = path.join(cwd, "math.ts");
+			const testFile = path.join(cwd, "math.test.ts");
+			await Bun.write(
+				source,
+				["export function addTwice(value: number): number {", "  const doubled = value * 2;", "  return doubled + 1;", "}", ""].join("\n"),
+			);
+			await Bun.write(
+				testFile,
+				[
+					'import { expect, test } from "bun:test";',
+					'import { addTwice } from "./math.ts";',
+					'test("adds through imported code", () => {',
+					"  const result = addTwice(20);",
+					"  expect(result).toBe(41);",
+					"});",
+					"",
+				].join("\n"),
+			);
+			const realSource = await fs.realpath(source);
+			const inspectorUrl = `ws://127.0.0.1:${getFreeTcpPort()}/${Bun.randomUUIDv7()}`;
+			target = Bun.spawn({
+				cmd: [process.execPath, "test", path.basename(testFile)],
+				cwd,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+				env: {
+					...Bun.env,
+					BUN_INSPECT: `${inspectorUrl}?break=1`,
+					BUN_INSPECT_NOTIFY: notify.url,
+					BUN_QUIET_DEBUG_LOGS: "1",
+					BUN_DEBUG_QUIET_LOGS: "1",
+					FORCE_COLOR: "0",
+				},
+				windowsHide: true,
+			});
+			const notifyResult = await Promise.race([notify.wait(10_000).then(() => undefined), target.exited.then((exitCode) => ({ exitCode }))]);
+			if (notifyResult) throw new Error(`Bun test attach target exited before inspector notification (exit code ${notifyResult.exitCode})`);
+
+			await manager.setBreakpoint(source, 2, undefined, undefined, 10_000, { ownerId });
+			const attached = await manager.attach({ ownerId, adapter: requireBunAdapter(cwd), program: testFile, cwd, url: inspectorUrl }, undefined, 30_000);
+			expect(attached.status).toBe("stopped");
+			expect(attached.source?.path).toBe(realSource);
+			expect(attached.line).toBe(2);
+
+			const stack = await manager.stackTrace(5, undefined, 10_000, { ownerId });
+			expect(stack.stackFrames[0]?.name).toBe("addTwice");
+			expect(stack.stackFrames[0]?.source?.path).toBe(realSource);
+			expect(stack.stackFrames[1]?.source?.path).toBe(await fs.realpath(testFile));
+			const frameId = stack.stackFrames[0]?.id;
+			expect(frameId).toBeGreaterThan(0);
+
+			const scopes = await manager.scopes(frameId!, undefined, 10_000, { ownerId });
+			expect(scopes.scopes.length).toBeGreaterThan(0);
+
+			const evaluated = await manager.evaluate("value", "repl", frameId, undefined, 10_000, { ownerId });
+			expect(evaluated.evaluation?.result).toBe("20");
+
+			const terminated = await manager.terminate(undefined, 10_000, { ownerId });
+			adapterTerminated = true;
+			expect(terminated.status).toBe("terminated");
+		} finally {
+			notify.close();
+			if (!adapterTerminated) await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			if (target?.exitCode === null) target.kill("SIGTERM");
+			await target?.exited.catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("disables Bun test timeouts for inspect-brk attach pauses", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-test-attach-timeout-"));
+		const notify = createInspectNotifyServer();
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-test-attach-timeout-${Bun.randomUUIDv7()}`;
+		let target: Subprocess<"ignore", "ignore", "pipe"> | undefined;
+		let adapterTerminated = false;
+		try {
+			const testFile = path.join(cwd, "timeout-attach.test.ts");
+			await Bun.write(
+				testFile,
+				[
+					'import { expect, test } from "bun:test";',
+					'test("survives attach pause", async () => {',
+					'  const marker = "before-pause";',
+					"  await Bun.sleep(10);",
+					'  expect(marker).toBe("before-pause");',
+					"});",
+					"",
+				].join("\n"),
+			);
+			const inspectorUrl = `ws://127.0.0.1:${getFreeTcpPort()}/${Bun.randomUUIDv7()}`;
+			target = Bun.spawn({
+				cmd: [process.execPath, "test", path.basename(testFile)],
+				cwd,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "pipe",
+				env: {
+					...Bun.env,
+					BUN_INSPECT: `${inspectorUrl}?break=1`,
+					BUN_INSPECT_NOTIFY: notify.url,
+					BUN_QUIET_DEBUG_LOGS: "1",
+					BUN_DEBUG_QUIET_LOGS: "1",
+					FORCE_COLOR: "0",
+				},
+				windowsHide: true,
+			});
+			const stderrPromise = new Response(target.stderr).text();
+			const notifyResult = await Promise.race([notify.wait(10_000).then(() => undefined), target.exited.then((exitCode) => ({ exitCode }))]);
+			if (notifyResult) throw new Error(`Bun test attach target exited before inspector notification (exit code ${notifyResult.exitCode})`);
+
+			await manager.setBreakpoint(testFile, 3, undefined, undefined, 10_000, { ownerId });
+			const attached = await manager.attach({ ownerId, adapter: requireBunAdapter(cwd), program: testFile, cwd, url: inspectorUrl }, undefined, 30_000);
+			expect(attached.status).toBe("stopped");
+			expect(attached.line).toBe(3);
+
+			await Bun.sleep(5_500);
+			const continued = await manager.continue(undefined, 20_000, { ownerId });
+			adapterTerminated = true;
+			expect(continued.state).toBe("terminated");
+			expect(await target.exited).toBe(0);
+			expect(await stderrPromise).not.toContain("timed out after");
+		} finally {
+			notify.close();
+			if (!adapterTerminated) await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			if (target?.exitCode === null) target.kill("SIGTERM");
+			await target?.exited.catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	it("reports array length from Bun object size and terminates after continue", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-array-"));
 		const manager = new DapSessionManager();
