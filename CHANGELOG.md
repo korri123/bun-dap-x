@@ -2,6 +2,13 @@
 
 All notable changes are managed by release-please from Conventional Commit history.
 
+## [0.2.1](https://github.com/korri123/bun-dap-x/compare/v0.2.0...v0.2.1) (2026-06-21)
+
+
+### Bug Fixes
+
+* make npm CLI bin publishable ([f8392ed](https://github.com/korri123/bun-dap-x/commit/f8392ed5f9b3b77715af5d43cb322c9b29388182))
+
 ## [0.2.0](https://github.com/korri123/bun-dap-x/compare/v0.1.0...v0.2.0) (2026-06-21)
 
 

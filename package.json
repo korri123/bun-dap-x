@@ -1,6 +1,6 @@
 {
 	"name": "bun-dap-x",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Standalone Debug Adapter Protocol server for Bun Inspector.",
 	"keywords": [
 		"bun",
