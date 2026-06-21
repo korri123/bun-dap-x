@@ -48,7 +48,8 @@ jobs:
         id: pack
         if: ${{ steps.release.outputs.release_created }}
         run: |
-          npm pack --json > npm-pack.json
+          bun run build
+          npm pack --json --ignore-scripts > npm-pack.json
           bun -e 'const pack = await Bun.file("npm-pack.json").json(); console.log(`tarball=${pack[0].filename}`);' >> "$GITHUB_OUTPUT"
 
       - name: Upload package artifact to GitHub Release
