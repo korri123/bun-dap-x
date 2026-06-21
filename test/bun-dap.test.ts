@@ -75,9 +75,9 @@ function createInspectNotifyServer(): InspectNotifyServer {
 	};
 }
 
-describe("bundled Bun DAP adapter", () => {
+describe("standalone Bun DAP adapter", () => {
 	it("launches Bun and stops on a pending source breakpoint before user code runs", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-${Bun.randomUUIDv7()}`;
 		try {
@@ -109,7 +109,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 45_000);
 
 	it("attaches to a Bun inspector target and evaluates locals at a breakpoint", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-attach-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-attach-"));
 		const notify = createInspectNotifyServer();
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-attach-${Bun.randomUUIDv7()}`;
@@ -175,7 +175,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 45_000);
 
 	it("reports array length from Bun object size and terminates after continue", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-array-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-array-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-array-${Bun.randomUUIDv7()}`;
 		try {
@@ -247,7 +247,7 @@ describe("bundled Bun DAP adapter", () => {
 			{ ownerPrefix: "condition", condition: "sample.label === 'beta'", hitCondition: undefined },
 			{ ownerPrefix: "hit", condition: undefined, hitCondition: "2" },
 		]) {
-			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `omp-bun-dap-${testCase.ownerPrefix}-`));
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `bun-dap-x-${testCase.ownerPrefix}-`));
 			const manager = new DapSessionManager();
 			const ownerId = `bun-dap-${testCase.ownerPrefix}-${Bun.randomUUIDv7()}`;
 			try {
@@ -293,8 +293,124 @@ describe("bundled Bun DAP adapter", () => {
 			}
 		}
 	}, 60_000);
+
+	it("binds DAP function breakpoints by scanning loaded Bun sources", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-function-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-function-${Bun.randomUUIDv7()}`;
+		try {
+			const program = path.join(cwd, "function-breakpoint.ts");
+			await Bun.write(
+				program,
+				[
+					"let total = 0;",
+					"function recordSample(sample: { label: string; value: number }) {",
+					"  const before = total;",
+					"  total += sample.value;",
+					"  return before;",
+					"}",
+					"recordSample({ label: 'alpha', value: 2 });",
+					"recordSample({ label: 'beta', value: 4 });",
+					"recordSample({ label: 'gamma', value: 6 });",
+					"console.log(total);",
+					"",
+				].join("\n"),
+			);
+			const realProgram = await fs.realpath(program);
+			await manager.setFunctionBreakpoint("recordSample", "sample.label === 'beta'", undefined, 10_000, { ownerId });
+
+			const snapshot = await manager.launch({ ownerId, adapter: requireBunAdapter(cwd), program, cwd }, undefined, 30_000);
+
+			expect(snapshot.status).toBe("stopped");
+			expect(snapshot.functionBreakpointCount).toBe(1);
+			expect(snapshot.frameName).toBe("recordSample");
+			expect(snapshot.source?.path).toBe(realProgram);
+			expect(snapshot.line).toBe(3);
+			expect((await manager.evaluate("sample.label", "repl", undefined, undefined, 10_000, { ownerId })).evaluation?.result).toBe("beta");
+			expect((await manager.evaluate("total", "repl", undefined, undefined, 10_000, { ownerId })).evaluation?.result).toBe("2");
+
+			const capabilities = manager.capabilities({ ownerId });
+			expect(capabilities.supportsFunctionBreakpoints).toBe(true);
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("pauses on uncaught exceptions through Bun Inspector exception breakpoints", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-exception-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-exception-${Bun.randomUUIDv7()}`;
+		try {
+			const program = path.join(cwd, "exception.ts");
+			await Bun.write(program, ["function explode() {", "  const marker = 'before throw';", "  throw new Error('boom');", "}", "explode();", ""].join("\n"));
+			await manager.setExceptionBreakpoints(["uncaught"], undefined, 10_000, { ownerId });
+
+			const snapshot = await manager.launch({ ownerId, adapter: requireBunAdapter(cwd), program, cwd }, undefined, 30_000);
+
+			expect(snapshot.status).toBe("stopped");
+			expect(snapshot.stopReason).toBe("exception");
+			expect(snapshot.frameName).toBe("explode");
+			expect(snapshot.line).toBe(3);
+			expect((await manager.evaluate("marker", "repl", undefined, undefined, 10_000, { ownerId })).evaluation?.result).toBe("before throw");
+			expect(
+				manager
+					.capabilities({ ownerId })
+					.exceptionBreakpointFilters?.map((filter) => filter.filter)
+					.sort((left, right) => left.localeCompare(right)),
+			).toEqual(["all", "uncaught"]);
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("leaves data and instruction breakpoints unsupported without Bun Inspector backing", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-unsupported-breakpoints-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-unsupported-breakpoints-${Bun.randomUUIDv7()}`;
+		try {
+			const program = path.join(cwd, "unsupported-breakpoints.ts");
+			await Bun.write(program, ["const value = 1;", "console.log(value);", "await new Promise(() => {});", ""].join("\n"));
+			await manager.setBreakpoint(program, 2, undefined, undefined, 10_000, { ownerId });
+
+			const snapshot = await manager.launch({ ownerId, adapter: requireBunAdapter(cwd), program, cwd }, undefined, 30_000);
+
+			expect(snapshot.status).toBe("stopped");
+			const capabilities = manager.capabilities({ ownerId });
+			expect(capabilities.supportsDataBreakpoints).not.toBe(true);
+			expect(capabilities.supportsInstructionBreakpoints).not.toBe(true);
+
+			let dataInfoError = "";
+			try {
+				await manager.customRequest("dataBreakpointInfo", { name: "value" }, undefined, 10_000, { ownerId });
+			} catch (error) {
+				dataInfoError = error instanceof Error ? error.message : String(error);
+			}
+			expect(dataInfoError).toContain("data breakpoints");
+
+			let dataSetError = "";
+			try {
+				await manager.customRequest("setDataBreakpoints", { breakpoints: [] }, undefined, 10_000, { ownerId });
+			} catch (error) {
+				dataSetError = error instanceof Error ? error.message : String(error);
+			}
+			expect(dataSetError).toContain("data breakpoints");
+
+			let instructionError = "";
+			try {
+				await manager.customRequest("setInstructionBreakpoints", { breakpoints: [] }, undefined, 10_000, { ownerId });
+			} catch (error) {
+				instructionError = error instanceof Error ? error.message : String(error);
+			}
+			expect(instructionError).toContain("instruction breakpoints");
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
 	it("binds breakpoints in imported TypeScript files", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-import-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-import-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-import-${Bun.randomUUIDv7()}`;
 		try {
@@ -335,7 +451,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 45_000);
 
 	it("steps over TypeScript call sites by source line", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-step-over-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-step-over-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-step-over-${Bun.randomUUIDv7()}`;
 		try {
@@ -417,7 +533,7 @@ describe("bundled Bun DAP adapter", () => {
 			{ ownerPrefix: "step-over-loop", breakpointLine: 12, action: "over" },
 			{ ownerPrefix: "step-out-loop", breakpointLine: 4, action: "out" },
 		] as const) {
-			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `omp-bun-dap-${testCase.ownerPrefix}-`));
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `bun-dap-x-${testCase.ownerPrefix}-`));
 			const manager = new DapSessionManager();
 			const ownerId = `bun-dap-${testCase.ownerPrefix}-${Bun.randomUUIDv7()}`;
 			try {
@@ -449,7 +565,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 60_000);
 
 	it("steps into local TypeScript call targets using temporary source breakpoints", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-step-in-local-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-step-in-local-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-step-in-local-${Bun.randomUUIDv7()}`;
 		try {
@@ -505,7 +621,7 @@ describe("bundled Bun DAP adapter", () => {
 				expectedTotal: "4",
 			},
 		]) {
-			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `omp-bun-dap-index-${testCase.ownerPrefix}-`));
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `bun-dap-x-index-${testCase.ownerPrefix}-`));
 			const manager = new DapSessionManager();
 			const ownerId = `bun-dap-index-${testCase.ownerPrefix}-${Bun.randomUUIDv7()}`;
 			try {
@@ -558,7 +674,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 60_000);
 
 	it("maps TypeScript function breakpoints back to source frames", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-source-map-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-source-map-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-source-map-${Bun.randomUUIDv7()}`;
 		try {
@@ -594,7 +710,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 45_000);
 
 	it("falls back to source-map binding when direct TypeScript lines are erased", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-erased-lines-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-erased-lines-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-erased-lines-${Bun.randomUUIDv7()}`;
 		try {
@@ -637,7 +753,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 45_000);
 
 	it("binds pre-launch imported TypeScript breakpoints after erased lines", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-prelaunch-erased-lines-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-prelaunch-erased-lines-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-prelaunch-erased-lines-${Bun.randomUUIDv7()}`;
 		try {
@@ -674,7 +790,7 @@ describe("bundled Bun DAP adapter", () => {
 	}, 45_000);
 
 	it("stops at late top-level TypeScript call-site breakpoints", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-dap-top-level-"));
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-top-level-"));
 		const manager = new DapSessionManager();
 		const ownerId = `bun-dap-top-level-${Bun.randomUUIDv7()}`;
 		try {
@@ -717,6 +833,102 @@ describe("bundled Bun DAP adapter", () => {
 			expect(snapshot.frameName).toBe("module code");
 			expect(snapshot.line).toBe(23);
 			expect((await manager.evaluate("samples.length", "repl", undefined, undefined, 10_000, { ownerId })).evaluation?.result).toBe("3");
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("supports setVariable, completions, and modules from Bun Inspector state", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-value-nav-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-value-nav-${Bun.randomUUIDv7()}`;
+		try {
+			const program = path.join(cwd, "value-nav.ts");
+			await Bun.write(
+				program,
+				[
+					"async function mutate(sample: { label: string; value: number }) {",
+					"  let total = sample.value;",
+					"  const holder = { count: total, nested: { label: sample.label } };",
+					"  console.log('before', total, holder.count, holder.nested.label);",
+					"  await Promise.resolve();",
+					"  console.log('after', total, holder.count, holder.nested.label);",
+					"}",
+					"await mutate({ label: 'alpha', value: 2 });",
+					"",
+				].join("\n"),
+			);
+			const realProgram = await fs.realpath(program);
+			await manager.setBreakpoint(program, 6, undefined, undefined, 10_000, { ownerId });
+
+			const snapshot = await manager.launch({ ownerId, adapter: requireBunAdapter(cwd), program, cwd }, undefined, 30_000);
+			expect(snapshot.status).toBe("stopped");
+			expect(snapshot.source?.path).toBe(realProgram);
+			expect(snapshot.line).toBe(6);
+
+			const capabilities = manager.capabilities({ ownerId });
+			expect(capabilities.supportsSetVariable).toBe(true);
+			expect(capabilities.supportsCompletionsRequest).toBe(true);
+			expect(capabilities.supportsModulesRequest).toBe(true);
+			expect(capabilities.supportsReadMemoryRequest).not.toBe(true);
+			expect(capabilities.supportsDisassembleRequest).not.toBe(true);
+
+			const stack = await manager.stackTrace(1, undefined, 10_000, { ownerId });
+			const frameId = stack.stackFrames[0]!.id;
+			const scopes = await manager.scopes(frameId, undefined, 10_000, { ownerId });
+			let localsReference = 0;
+			for (const scope of scopes.scopes) {
+				const variables = await manager.variables(scope.variablesReference, undefined, 10_000, { ownerId });
+				const total = variables.variables.find((variable) => variable.name === "total");
+				const holder = variables.variables.find((variable) => variable.name === "holder");
+				if (total && holder) {
+					localsReference = scope.variablesReference;
+					expect(total.value).toBe("2");
+				}
+			}
+			expect(localsReference).toBeGreaterThan(0);
+			const holderReference = (await manager.evaluate("holder", "repl", frameId, undefined, 10_000, { ownerId })).evaluation?.variablesReference ?? 0;
+			expect(holderReference).toBeGreaterThan(0);
+
+			const totalSet = (
+				await manager.customRequest("setVariable", { variablesReference: localsReference, name: "total", value: "41" }, undefined, 10_000, { ownerId })
+			).body as { value?: string; type?: string };
+			expect(totalSet.value).toBe("41");
+			expect((await manager.evaluate("total", "repl", frameId, undefined, 10_000, { ownerId })).evaluation?.result).toBe("41");
+
+			const holderSet = (
+				await manager.customRequest("setVariable", { variablesReference: holderReference, name: "count", value: "total + 1" }, undefined, 10_000, { ownerId })
+			).body as { value?: string; type?: string };
+			expect(holderSet.value).toBe("42");
+			expect((await manager.evaluate("holder.count", "repl", frameId, undefined, 10_000, { ownerId })).evaluation?.result).toBe("42");
+
+			const localCompletions = (await manager.customRequest("completions", { frameId, text: "tot", column: 4 }, undefined, 10_000, { ownerId })).body as {
+				targets?: { label?: string; start?: number; length?: number }[];
+			};
+			const totalCompletion = localCompletions.targets?.find((target) => target.label === "total");
+			expect(totalCompletion?.start).toBe(1);
+			expect(totalCompletion?.length).toBe(3);
+
+			const memberCompletions = (await manager.customRequest("completions", { frameId, text: "sample.la", column: 10 }, undefined, 10_000, { ownerId }))
+				.body as { targets?: { label?: string }[] };
+			expect(memberCompletions.targets?.map((target) => target.label)).toContain("label");
+
+			const globalCompletions = (await manager.customRequest("completions", { frameId, text: "Prom", column: 5 }, undefined, 10_000, { ownerId })).body as {
+				targets?: { label?: string }[];
+			};
+			expect(globalCompletions.targets?.map((target) => target.label)).toContain("Promise");
+
+			const modules = (await manager.customRequest("modules", { startModule: 0, moduleCount: 100 }, undefined, 10_000, { ownerId })).body as {
+				modules?: { path?: string; name?: string }[];
+				totalModules?: number;
+			};
+			expect(modules.totalModules).toBeGreaterThan(0);
+			expect(modules.modules?.some((entry) => entry.path === realProgram || entry.name === path.basename(realProgram))).toBe(true);
+
+			const continued = await manager.continue(undefined, 10_000, { ownerId });
+			expect(continued.state).toBe("terminated");
+			expect(manager.getOutput(undefined, { ownerId }).output).toContain("after 41 42 alpha");
 		} finally {
 			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
 			await fs.rm(cwd, { recursive: true, force: true });

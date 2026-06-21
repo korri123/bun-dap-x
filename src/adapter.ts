@@ -4,7 +4,16 @@ import * as url from "node:url";
 import type { Subprocess } from "bun";
 import type { LineRange, MappedPosition, RawSourceMap } from "source-map-js";
 import { SourceMapConsumer } from "source-map-js";
-import type { DapBreakpoint, DapCapabilities, DapEventMessage, DapRequestMessage, DapResponseMessage, DapSource, DapSourceBreakpoint } from "./protocol.ts";
+import type {
+	DapBreakpoint,
+	DapCapabilities,
+	DapEventMessage,
+	DapFunctionBreakpoint,
+	DapRequestMessage,
+	DapResponseMessage,
+	DapSource,
+	DapSourceBreakpoint,
+} from "./protocol.ts";
 
 type DapBody = Record<string, unknown>;
 
@@ -56,6 +65,11 @@ interface InspectorRemoteObject {
 	objectId?: string;
 	size?: number;
 }
+interface InspectorCallArgument {
+	value?: unknown;
+	unserializableValue?: string;
+	objectId?: string;
+}
 
 interface InspectorScope {
 	type: string;
@@ -93,6 +107,11 @@ interface StepInTarget {
 	column: number;
 }
 
+interface FunctionTargetMatch {
+	script?: InspectorScript;
+	target: StepInTarget;
+}
+
 interface TemporaryInstalledBreakpoint {
 	sourceKey: string;
 	inspectorId: string;
@@ -108,6 +127,23 @@ interface VariableHandle {
 	type?: string;
 	subtype?: string;
 	size?: number;
+	frameId?: string;
+	isScope?: boolean;
+}
+
+interface CompletionContext {
+	receiverExpression?: string;
+	prefix: string;
+	start: number;
+	length: number;
+}
+
+interface CompletionItem {
+	label: string;
+	type?: string;
+	start: number;
+	length: number;
+	sortText?: string;
 }
 
 interface StoredBreakpoint {
@@ -120,24 +156,42 @@ interface StoredBreakpoint {
 	message?: string;
 }
 
+interface StoredFunctionBreakpoint {
+	dapId: number;
+	request: DapFunctionBreakpoint;
+	verified: boolean;
+	entry?: StoredBreakpoint;
+	message?: string;
+}
+
 interface TcpNotifyServer {
 	url: string;
 	wait(timeoutMs: number): Promise<void>;
 	close(): void;
 }
 
+type InspectorPauseOnExceptionsState = "none" | "uncaught" | "all";
+
 const THREAD_ID = 1;
 const DEFAULT_ATTACH_PORT = 6499;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const CAPABILITIES: DapCapabilities = {
 	supportsConfigurationDoneRequest: true,
+	supportsFunctionBreakpoints: true,
 	supportsConditionalBreakpoints: true,
 	supportsHitConditionalBreakpoints: true,
 	supportsLogPoints: true,
 	supportsEvaluateForHovers: true,
+	supportsSetVariable: true,
+	supportsCompletionsRequest: true,
 	supportsTerminateRequest: true,
 	supportsLoadedSourcesRequest: true,
 	supportsBreakpointLocationsRequest: true,
+	supportsModulesRequest: true,
+	exceptionBreakpointFilters: [
+		{ filter: "uncaught", label: "Uncaught Exceptions", description: "Pause when an exception is not caught.", default: false },
+		{ filter: "all", label: "All Exceptions", description: "Pause whenever an exception is thrown.", default: false },
+	],
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -330,8 +384,9 @@ function callNamesFromLine(line: string | undefined): string[] {
 
 function firstFunctionBodyLine(lines: string[], declarationIndex: number): number {
 	const declaration = lines[declarationIndex] ?? "";
-	const braceIndex = declaration.indexOf("{");
+	const braceIndex = declaration.lastIndexOf("{");
 	if (braceIndex !== -1 && declaration.slice(braceIndex + 1).trim().length > 0) return declarationIndex + 1;
+	if (braceIndex === -1 && declaration.includes("=>")) return declarationIndex + 1;
 	return nextSourceStepLineFromLines(lines, declarationIndex + 1) ?? declarationIndex + 1;
 }
 
@@ -342,21 +397,33 @@ function nextSourceStepLineFromLines(lines: string[], startIndex: number): numbe
 	return undefined;
 }
 
-function findFunctionTarget(sourcePath: string, name: string, defaultExport: boolean): StepInTarget | undefined {
+function functionSearchName(name: string): string | undefined {
+	const simpleName = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : name;
+	return /^[A-Za-z_$][\w$]*$/.test(simpleName) ? simpleName : undefined;
+}
+
+function findFunctionTargets(sourcePath: string, name: string, defaultExport: boolean): StepInTarget[] {
 	const lines = sourceLines(sourcePath);
-	if (lines.length === 0) return undefined;
-	const escaped = escapeRegExp(name);
+	const simpleName = functionSearchName(name);
+	if (lines.length === 0 || !simpleName) return [];
+	const escaped = escapeRegExp(simpleName);
 	const declarations = [
 		new RegExp(`^\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${escaped}\\s*\\(`),
 		new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${escaped}\\s*=`),
+		new RegExp(`^\\s*(?:(?:public|private|protected|static|async|get|set)\\s+)*${escaped}\\s*\\([^)]*\\)\\s*\\{`),
 	];
 	const defaultDeclaration = /^\s*export\s+default\s+(?:async\s+)?function(?:\s+[A-Za-z_$][\w$]*)?\s*\(/;
+	const targets: StepInTarget[] = [];
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index] ?? "";
 		if (!declarations.some((regex) => regex.test(line)) && !(defaultExport && defaultDeclaration.test(line))) continue;
-		return { sourcePath, line: firstFunctionBodyLine(lines, index), column: 1 };
+		targets.push({ sourcePath, line: firstFunctionBodyLine(lines, index), column: 1 });
 	}
-	return undefined;
+	return targets;
+}
+
+function findFunctionTarget(sourcePath: string, name: string, defaultExport: boolean): StepInTarget | undefined {
+	return findFunctionTargets(sourcePath, name, defaultExport)[0];
 }
 
 function resolveImportSource(importerPath: string, specifier: string): string | undefined {
@@ -624,6 +691,34 @@ function remoteObjectToString(value: InspectorRemoteObject | undefined): string 
 	return value.type ?? "undefined";
 }
 
+function isIdentifierName(value: string): boolean {
+	return /^[A-Za-z_$][\w$]*$/.test(value);
+}
+
+function completionContextFromArgs(args: DapBody): CompletionContext {
+	const text = typeof args.text === "string" ? args.text : "";
+	const column = numberArg(args.column);
+	const cursor = Math.min(text.length, Math.max((column ?? text.length + 1) - 1, 0));
+	const beforeCursor = text.slice(0, cursor);
+	const memberMatch = /((?:this|globalThis|[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)\.\s*([A-Za-z_$][\w$]*)?$/.exec(beforeCursor);
+	if (memberMatch?.[1]) {
+		const prefix = memberMatch[2] ?? "";
+		return {
+			receiverExpression: memberMatch[1],
+			prefix,
+			start: cursor - prefix.length + 1,
+			length: prefix.length,
+		};
+	}
+	const nameMatch = /([A-Za-z_$][\w$]*)$/.exec(beforeCursor);
+	const prefix = nameMatch?.[1] ?? "";
+	return {
+		prefix,
+		start: cursor - prefix.length + 1,
+		length: prefix.length,
+	};
+}
+
 function breakpointOptions(breakpoint: DapSourceBreakpoint): Record<string, unknown> | undefined {
 	const options: Record<string, unknown> = {};
 	if (breakpoint.condition) options.condition = breakpoint.condition;
@@ -879,6 +974,8 @@ class BunDebugAdapter {
 	#variableHandles = new Map<number, VariableHandle>();
 	#nextVariableReference = 1;
 	#breakpointsBySource = new Map<string, StoredBreakpoint[]>();
+	#functionBreakpoints: StoredFunctionBreakpoint[] = [];
+	#knownFunctionSourcePaths = new Set<string>();
 	#breakpointsByInspectorId = new Map<string, StoredBreakpoint>();
 	#placeholderBreakpointsByInspectorId = new Map<string, StoredBreakpoint>();
 	#temporaryBreakpointIds = new Set<string>();
@@ -897,6 +994,7 @@ class BunDebugAdapter {
 	#nextBreakpointId = 1;
 	#configurationDone = false;
 	#terminatedSent = false;
+	#exceptionPauseState: InspectorPauseOnExceptionsState = "none";
 	#suppressInitialPause = false;
 	#deferredInitialPause: unknown;
 
@@ -968,6 +1066,19 @@ class BunDebugAdapter {
 				case "setBreakpoints":
 					this.#sendResponse(request, await this.#setBreakpoints(this.#args(request)));
 					return;
+				case "setFunctionBreakpoints":
+					this.#sendResponse(request, await this.#setFunctionBreakpoints(this.#args(request)));
+					return;
+				case "setExceptionBreakpoints":
+					this.#sendResponse(request, await this.#setExceptionBreakpoints(this.#args(request)));
+					return;
+				case "dataBreakpointInfo":
+				case "setDataBreakpoints":
+					this.#sendErrorResponse(request, "Bun Inspector does not support data breakpoints");
+					return;
+				case "setInstructionBreakpoints":
+					this.#sendErrorResponse(request, "Bun Inspector does not support instruction breakpoints");
+					return;
 				case "threads":
 					this.#sendResponse(request, { threads: [{ id: THREAD_ID, name: "bun" }] });
 					return;
@@ -980,9 +1091,17 @@ class BunDebugAdapter {
 				case "variables":
 					this.#sendResponse(request, await this.#variables(this.#args(request)));
 					return;
+				case "setVariable":
+					this.#sendResponse(request, await this.#setVariable(this.#args(request)));
+					return;
+
 				case "evaluate":
 					this.#sendResponse(request, await this.#evaluate(this.#args(request)));
 					return;
+				case "completions":
+					this.#sendResponse(request, await this.#completions(this.#args(request)));
+					return;
+
 				case "continue":
 					await this.#debuggerCommand("Debugger.resume");
 					this.#sendResponse(request, { allThreadsContinued: true });
@@ -1008,6 +1127,9 @@ class BunDebugAdapter {
 					return;
 				case "loadedSources":
 					this.#sendResponse(request, this.#loadedSources());
+					return;
+				case "modules":
+					this.#sendResponse(request, this.#modules(this.#args(request)));
 					return;
 				case "terminate":
 					this.dispose();
@@ -1069,6 +1191,7 @@ class BunDebugAdapter {
 		const program = stringArg(args.program);
 		if (!program) throw new Error("Bun launch requires program");
 		const cwd = stringArg(args.cwd) ?? process.cwd();
+		this.#rememberFunctionSourcePath(program, cwd);
 		const runtime = stringArg(args.runtime) ?? stringArg(args.runtimeExecutable) ?? "bun";
 		const runtimeArgs = stringArrayArg(args.runtimeArgs);
 		const processArgs = [...runtimeArgs, program, ...stringArrayArg(args.args)];
@@ -1119,6 +1242,7 @@ class BunDebugAdapter {
 	}
 
 	async #attach(args: DapBody): Promise<void> {
+		this.#rememberFunctionSourcePath(stringArg(args.program), stringArg(args.cwd) ?? process.cwd());
 		const attachUrl = stringArg(args.url) ?? stringArg(args.inspectorUrl) ?? this.#buildAttachUrl(args);
 		await this.#connectInspector(attachUrl);
 	}
@@ -1154,7 +1278,7 @@ class BunDebugAdapter {
 			if (!/already enabled/i.test(toErrorMessage(error))) throw toError(error);
 		});
 		void inspector.send("Debugger.setAsyncStackTraceDepth", { depth: 200 }).catch(() => undefined);
-		void inspector.send("Debugger.setPauseOnExceptions", { state: "none" }).catch(() => undefined);
+		void inspector.send("Debugger.setPauseOnExceptions", { state: this.#exceptionPauseState }).catch(() => undefined);
 	}
 
 	async #configurationDoneRequest(): Promise<void> {
@@ -1191,6 +1315,178 @@ class BunDebugAdapter {
 		return { breakpoints: installed.map((entry) => this.#toDapBreakpoint(entry)) };
 	}
 
+	async #setFunctionBreakpoints(args: DapBody): Promise<{ breakpoints: DapBreakpoint[] }> {
+		const breakpoints = Array.isArray(args.breakpoints)
+			? args.breakpoints.filter((entry): entry is DapFunctionBreakpoint => isRecord(entry) && typeof entry.name === "string" && entry.name.length > 0)
+			: [];
+		for (const entry of this.#functionBreakpoints) {
+			await this.#removeFunctionBreakpoint(entry);
+		}
+		this.#functionBreakpoints = [];
+		for (const breakpoint of breakpoints) {
+			const entry: StoredFunctionBreakpoint = {
+				dapId: this.#nextBreakpointId++,
+				request: breakpoint,
+				verified: false,
+			};
+			await this.#installFunctionBreakpoint(entry);
+			this.#functionBreakpoints.push(entry);
+		}
+		return { breakpoints: this.#functionBreakpoints.map((entry) => this.#toDapFunctionBreakpoint(entry)) };
+	}
+
+	async #setExceptionBreakpoints(args: DapBody): Promise<{ breakpoints: DapBreakpoint[] }> {
+		const requested = this.#exceptionBreakpointRequests(args);
+		const enabled = requested.filter((entry) => entry.condition === undefined && this.#isSupportedExceptionFilter(entry.filter)).map((entry) => entry.filter);
+		this.#exceptionPauseState = this.#exceptionPauseStateForFilters(enabled);
+		await this.#requiredInspector().send("Debugger.setPauseOnExceptions", { state: this.#exceptionPauseState });
+		return {
+			breakpoints: requested.map((entry) => {
+				if (entry.condition !== undefined) {
+					return { verified: false, message: "Bun Inspector exception breakpoints do not support conditions" };
+				}
+				if (!this.#isSupportedExceptionFilter(entry.filter)) {
+					return { verified: false, message: `Unsupported exception breakpoint filter '${entry.filter}'` };
+				}
+				return { verified: true };
+			}),
+		};
+	}
+
+	#exceptionBreakpointRequests(args: DapBody): Array<{ filter: string; condition?: string }> {
+		const requests: Array<{ filter: string; condition?: string }> = stringArrayArg(args.filters).map((filter) => ({ filter }));
+		if (!Array.isArray(args.filterOptions)) return requests;
+		for (const option of args.filterOptions) {
+			if (!isRecord(option)) continue;
+			const filter = stringArg(option.filterId);
+			if (!filter) continue;
+			const condition = stringArg(option.condition);
+			requests.push({ filter, ...(condition ? { condition } : {}) });
+		}
+		return requests;
+	}
+
+	#isSupportedExceptionFilter(filter: string): boolean {
+		return filter === "all" || filter === "uncaught";
+	}
+
+	#exceptionPauseStateForFilters(filters: string[]): InspectorPauseOnExceptionsState {
+		if (filters.includes("all")) return "all";
+		if (filters.includes("uncaught")) return "uncaught";
+		return "none";
+	}
+
+	async #removeFunctionBreakpoint(entry: StoredFunctionBreakpoint): Promise<void> {
+		const installed = entry.entry;
+		if (!installed) return;
+		const inspector = this.#inspector;
+		if (inspector) {
+			const ids = this.#breakpointIdsForEntry(installed);
+			await Promise.allSettled(ids.map((id) => inspector.send("Debugger.removeBreakpoint", { breakpointId: id }).catch(() => undefined)));
+		}
+		this.#forgetBreakpointIdsForEntry(installed);
+		entry.entry = undefined;
+		entry.verified = false;
+	}
+
+	async #installFunctionBreakpoint(entry: StoredFunctionBreakpoint): Promise<boolean> {
+		const matches = this.#functionTargetMatches(entry.request.name);
+		if (matches.length !== 1) {
+			entry.verified = false;
+			entry.message =
+				matches.length === 0
+					? `No loaded function declaration named '${entry.request.name}' was found`
+					: `Function breakpoint '${entry.request.name}' matched multiple loaded declarations`;
+			return false;
+		}
+		await this.#removeFunctionBreakpoint(entry);
+		const match = matches[0]!;
+		const installed: StoredBreakpoint = {
+			dapId: entry.dapId,
+			sourceKey: match.target.sourcePath,
+			request: {
+				line: match.target.line,
+				...(entry.request.condition ? { condition: entry.request.condition } : {}),
+				...(entry.request.hitCondition ? { hitCondition: entry.request.hitCondition } : {}),
+			},
+			verified: false,
+		};
+		entry.entry = installed;
+		await this.#installFunctionBreakpointByUrl(installed).catch((error) => {
+			installed.message = toErrorMessage(error);
+			return false;
+		});
+		this.#syncFunctionBreakpoint(entry);
+		return entry.verified;
+	}
+
+	async #installFunctionBreakpointByUrl(entry: StoredBreakpoint): Promise<boolean> {
+		return await this.#bindBreakpointByUrl(entry, this.#breakpointByUrlParams(entry));
+	}
+
+	#breakpointByUrlParams(entry: StoredBreakpoint): Record<string, unknown> {
+		const params: Record<string, unknown> = {
+			url: inspectorUrlForSource(entry.sourceKey),
+			lineNumber: Math.max(entry.request.line - 1, 0),
+			columnNumber: breakpointColumn(entry.sourceKey, entry.request),
+		};
+		const options = breakpointOptions(entry.request);
+		if (options) params.options = options;
+		return params;
+	}
+
+	async #bindBreakpointByUrl(entry: StoredBreakpoint, params: Record<string, unknown>): Promise<boolean> {
+		const inspector = this.#inspector;
+		if (!inspector) return false;
+		const result = await inspector.send<InspectorSetBreakpointResult>("Debugger.setBreakpointByUrl", params);
+		this.#applyBreakpointResult(entry, result);
+		if (entry.inspectorId) this.#breakpointsByInspectorId.set(entry.inspectorId, entry);
+		return entry.inspectorId !== undefined;
+	}
+
+	#syncFunctionBreakpoint(entry: StoredFunctionBreakpoint): void {
+		entry.verified = entry.entry?.verified ?? false;
+		entry.message = entry.entry?.message;
+	}
+
+	#rememberFunctionSourcePath(sourcePath: string | undefined, cwd: string): void {
+		if (!sourcePath) return;
+		this.#knownFunctionSourcePaths.add(canonicalizeSourcePath(path.isAbsolute(sourcePath) ? sourcePath : path.resolve(cwd, sourcePath)));
+	}
+
+	#functionTargetMatches(name: string): FunctionTargetMatch[] {
+		const matches: FunctionTargetMatch[] = [];
+		const seen = new Set<string>();
+		for (const script of this.#scriptsById.values()) {
+			for (const sourcePath of this.#sourcePathsForScript(script)) {
+				this.#appendFunctionTargetMatches(matches, seen, sourcePath, name, script);
+			}
+		}
+		for (const sourcePath of this.#knownFunctionSourcePaths) {
+			this.#appendFunctionTargetMatches(matches, seen, sourcePath, name);
+		}
+		return matches;
+	}
+
+	#appendFunctionTargetMatches(matches: FunctionTargetMatch[], seen: Set<string>, sourcePath: string, name: string, script?: InspectorScript): void {
+		for (const target of findFunctionTargets(sourcePath, name, name === "default")) {
+			const key = `${target.sourcePath}:${target.line}:${target.column}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			matches.push(script ? { script, target } : { target });
+		}
+	}
+
+	#sourcePathsForScript(script: InspectorScript): string[] {
+		const paths = new Set<string>();
+		for (const source of [script.url, ...(script.sourceMap?.sources() ?? [])]) {
+			if (!source) continue;
+			const sourcePath = sourceMapPathFromUrl(source) ?? (path.isAbsolute(source) ? source : undefined);
+			if (sourcePath) paths.add(canonicalizeSourcePath(sourcePath));
+		}
+		return Array.from(paths);
+	}
+
 	async #installBreakpoint(key: string, breakpoint: DapSourceBreakpoint): Promise<StoredBreakpoint> {
 		const entry: StoredBreakpoint = {
 			dapId: this.#nextBreakpointId++,
@@ -1211,19 +1507,8 @@ class BunDebugAdapter {
 		const shouldDeferUntilSourceMap =
 			!loadedScript && sourceNeedsGeneratedMapping(key) && breakpoint.line > 1 && sourceCanDriftBeforeLine(key, breakpoint.line);
 		if (!shouldDeferUntilSourceMap) {
-			const params: Record<string, unknown> = {
-				url: inspectorUrlForSource(key),
-				lineNumber: Math.max(breakpoint.line - 1, 0),
-				columnNumber: breakpointColumn(key, breakpoint),
-			};
-			const options = breakpointOptions(breakpoint);
-			if (options) params.options = options;
 			try {
-				const result = await inspector.send<InspectorSetBreakpointResult>("Debugger.setBreakpointByUrl", params);
-				entry.inspectorId = result.breakpointId;
-				entry.location = result.locations?.[0] ?? result.actualLocation;
-				entry.verified = entry.location !== undefined;
-				if (entry.inspectorId) this.#breakpointsByInspectorId.set(entry.inspectorId, entry);
+				await this.#bindBreakpointByUrl(entry, this.#breakpointByUrlParams(entry));
 			} catch (error) {
 				entry.message = entry.message ?? toErrorMessage(error);
 			}
@@ -1343,33 +1628,36 @@ class BunDebugAdapter {
 		return { script, sourcePath: original.sourcePath, line: original.line, column: original.column };
 	}
 
+	#allBreakpointEntries(): StoredBreakpoint[] {
+		return [
+			...Array.from(this.#breakpointsBySource.values()).flat(),
+			...this.#functionBreakpoints.map((entry) => entry.entry).filter((entry): entry is StoredBreakpoint => entry !== undefined),
+		];
+	}
+
 	#breakpointOverrideForLocation(location: InspectorLocation): { sourcePath: string; line: number; column: number } | undefined {
 		const step = this.#lastStepLocationOverride;
 		if (step?.scriptId === location.scriptId && step.lineNumber === location.lineNumber) {
 			return { sourcePath: step.sourcePath, line: step.line, column: step.column };
 		}
-		for (const entries of this.#breakpointsBySource.values()) {
-			for (const entry of entries) {
-				if (entry.location?.scriptId !== location.scriptId || entry.location.lineNumber !== location.lineNumber) {
-					continue;
-				}
-				return {
-					sourcePath: entry.sourceKey,
-					line: entry.request.line,
-					column: entry.request.column ?? 1,
-				};
+		for (const entry of this.#allBreakpointEntries()) {
+			if (entry.location?.scriptId !== location.scriptId || entry.location.lineNumber !== location.lineNumber) {
+				continue;
 			}
+			return {
+				sourcePath: entry.sourceKey,
+				line: entry.request.line,
+				column: entry.request.column ?? 1,
+			};
 		}
 		return undefined;
 	}
 
 	#breakpointEntriesForLocation(location: InspectorLocation): StoredBreakpoint[] {
 		const entries: StoredBreakpoint[] = [];
-		for (const sourceEntries of this.#breakpointsBySource.values()) {
-			for (const entry of sourceEntries) {
-				if (entry.location?.scriptId === location.scriptId && entry.location.lineNumber === location.lineNumber) {
-					entries.push(entry);
-				}
+		for (const entry of this.#allBreakpointEntries()) {
+			if (entry.location?.scriptId === location.scriptId && entry.location.lineNumber === location.lineNumber) {
+				entries.push(entry);
 			}
 		}
 		return entries;
@@ -1377,11 +1665,8 @@ class BunDebugAdapter {
 
 	#breakpointEntriesForSourceLine(sourcePath: string, line: number): StoredBreakpoint[] {
 		const entries: StoredBreakpoint[] = [];
-		for (const [sourceKey, sourceEntries] of this.#breakpointsBySource) {
-			if (!pathsLikelyMatch(sourceKey, sourcePath)) continue;
-			for (const entry of sourceEntries) {
-				if (entry.request.line === line) entries.push(entry);
-			}
+		for (const entry of this.#allBreakpointEntries()) {
+			if (pathsLikelyMatch(entry.sourceKey, sourcePath) && entry.request.line === line) entries.push(entry);
 		}
 		return entries;
 	}
@@ -1587,6 +1872,8 @@ class BunDebugAdapter {
 			entry.message = toErrorMessage(error);
 			return false;
 		});
+		const functionEntry = this.#functionBreakpoints.find((candidate) => candidate.entry === entry);
+		if (functionEntry) this.#syncFunctionBreakpoint(functionEntry);
 		if (rebound) this.#sendEvent("breakpoint", { reason: "changed", breakpoint: this.#toDapBreakpoint(entry) });
 		return rebound;
 	}
@@ -1653,11 +1940,25 @@ class BunDebugAdapter {
 			}
 		}
 	}
+	async #rebindFunctionBreakpointsForLoadedScripts(): Promise<void> {
+		for (const entry of this.#functionBreakpoints) {
+			if (entry.entry?.verified) continue;
+			if (entry.entry) {
+				await this.#tryRebindBreakpoint(entry.entry);
+				this.#syncFunctionBreakpoint(entry);
+				continue;
+			}
+			if (await this.#installFunctionBreakpoint(entry)) {
+				this.#sendEvent("breakpoint", { reason: "changed", breakpoint: this.#toDapFunctionBreakpoint(entry) });
+			}
+		}
+	}
 
 	async #rebindBreakpointsForLoadedScripts(): Promise<void> {
 		for (const script of this.#scriptsById.values()) {
 			await this.#rebindBreakpointsForScript(script);
 		}
+		await this.#rebindFunctionBreakpointsForLoadedScripts();
 	}
 
 	#toDapBreakpoint(entry: StoredBreakpoint): DapBreakpoint {
@@ -1669,6 +1970,16 @@ class BunDebugAdapter {
 			line: entry.request.line,
 			column: entry.request.column,
 		};
+	}
+
+	#toDapFunctionBreakpoint(entry: StoredFunctionBreakpoint): DapBreakpoint {
+		return entry.entry
+			? this.#toDapBreakpoint(entry.entry)
+			: {
+					id: entry.dapId,
+					verified: entry.verified,
+					...(entry.message ? { message: entry.message } : {}),
+				};
 	}
 
 	#stackTrace(args: DapBody): DapBody {
@@ -1694,7 +2005,7 @@ class BunDebugAdapter {
 		return {
 			scopes: (frame?.scopeChain ?? []).map((scope) => ({
 				name: scope.name || scope.type,
-				variablesReference: this.#createVariableReference(this.#variableHandleFromRemoteObject(scope.object)),
+				variablesReference: this.#createVariableReference(this.#variableHandleFromRemoteObject(scope.object, frame?.callFrameId, true)),
 				expensive: scope.type === "global",
 			})),
 		};
@@ -1723,43 +2034,203 @@ class BunDebugAdapter {
 					name: property.name,
 					value: remoteObjectToString(value),
 					type: variableType(value),
-					variablesReference: value?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(value)) : 0,
+					variablesReference: value?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(value, handle.frameId)) : 0,
+
 					...(value && isArrayLikeRemoteObject(value) && value.size !== undefined ? { indexedVariables: value.size } : {}),
 				};
 			}),
 		};
 	}
 
-	async #evaluate(args: DapBody): Promise<DapBody> {
-		const expression = stringArg(args.expression);
-		if (!expression) throw new Error("evaluate requires expression");
-		const frameId = numberArg(args.frameId);
-		const frame = frameId ? this.#frames[frameId - 1] : undefined;
-		const result = frame
+	async #setVariable(args: DapBody): Promise<DapBody> {
+		const reference = numberArg(args.variablesReference);
+		const name = typeof args.name === "string" && args.name.length > 0 ? args.name : undefined;
+		const valueExpression = typeof args.value === "string" ? args.value : undefined;
+		if (reference === undefined || reference <= 0) throw new Error("setVariable requires variablesReference");
+		if (!name) throw new Error("setVariable requires name");
+		if (valueExpression === undefined) throw new Error("setVariable requires value");
+		const handle = this.#variableHandles.get(reference);
+		if (!handle) throw new Error(`Unknown variablesReference ${reference}`);
+		const value =
+			handle.isScope && handle.frameId && isIdentifierName(name)
+				? await this.#setCallFrameVariable(handle.frameId, name, valueExpression)
+				: await this.#setObjectProperty(handle, name, valueExpression);
+		return this.#variableResponseFromRemoteObject(value, handle.frameId);
+	}
+
+	async #setCallFrameVariable(frameId: string, name: string, valueExpression: string): Promise<InspectorRemoteObject | undefined> {
+		const result = await this.#requiredInspector().send<{ result?: InspectorRemoteObject }>("Debugger.evaluateOnCallFrame", {
+			callFrameId: frameId,
+			expression: `${name} = (${valueExpression})`,
+			objectGroup: "bun-dap-x",
+			includeCommandLineAPI: true,
+			doNotPauseOnExceptionsAndMuteConsole: false,
+		});
+		return result.result;
+	}
+
+	async #setObjectProperty(handle: VariableHandle, name: string, valueExpression: string): Promise<InspectorRemoteObject | undefined> {
+		if (!handle.objectId) throw new Error("setVariable target is not assignable");
+		const value = await this.#evaluateAssignmentValue(valueExpression, handle.frameId);
+		const result = await this.#requiredInspector().send<{ result?: InspectorRemoteObject }>("Runtime.callFunctionOn", {
+			objectId: handle.objectId,
+			functionDeclaration: "function(name, value) { this[name] = value; return this[name]; }",
+			arguments: [{ value: name }, this.#callArgumentFromRemoteObject(value)],
+			objectGroup: "bun-dap-x",
+			awaitPromise: true,
+			returnByValue: false,
+		});
+		return result.result;
+	}
+
+	async #evaluateExpression(expression: string, frameId: string | undefined, muteConsole = false): Promise<InspectorRemoteObject | undefined> {
+		const result = frameId
 			? await this.#requiredInspector().send<{ result?: InspectorRemoteObject }>("Debugger.evaluateOnCallFrame", {
-					callFrameId: frame.callFrameId,
+					callFrameId: frameId,
 					expression,
-					objectGroup: "omp-dap",
+					objectGroup: "bun-dap-x",
 					includeCommandLineAPI: true,
-					doNotPauseOnExceptionsAndMuteConsole: false,
+					doNotPauseOnExceptionsAndMuteConsole: muteConsole,
 				})
 			: await this.#requiredInspector().send<{ result?: InspectorRemoteObject }>("Runtime.evaluate", {
 					expression,
-					objectGroup: "omp-dap",
+					objectGroup: "bun-dap-x",
 					includeCommandLineAPI: true,
 				});
+		return result.result;
+	}
+
+	async #evaluateAssignmentValue(expression: string, frameId: string | undefined): Promise<InspectorRemoteObject> {
+		return (await this.#evaluateExpression(expression, frameId)) ?? { type: "undefined" };
+	}
+
+	#callArgumentFromRemoteObject(value: InspectorRemoteObject): InspectorCallArgument {
+		if (value.objectId) return { objectId: value.objectId };
+		if (value.unserializableValue) return { unserializableValue: value.unserializableValue };
+		return { value: value.value };
+	}
+
+	#variableResponseFromRemoteObject(value: InspectorRemoteObject | undefined, frameId: string | undefined): DapBody {
 		return {
-			result: remoteObjectToString(result.result),
-			type: variableType(result.result),
-			variablesReference: result.result?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(result.result)) : 0,
-			...(result.result && isArrayLikeRemoteObject(result.result) && result.result.size !== undefined ? { indexedVariables: result.result.size } : {}),
+			value: remoteObjectToString(value),
+			type: variableType(value),
+			variablesReference: value?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(value, frameId)) : 0,
+			...(value && isArrayLikeRemoteObject(value) && value.size !== undefined ? { indexedVariables: value.size } : {}),
 		};
+	}
+
+	async #evaluate(args: DapBody): Promise<DapBody> {
+		const expression = stringArg(args.expression);
+		if (!expression) throw new Error("evaluate requires expression");
+		const frame = this.#frameFromArgs(args);
+		const value = await this.#evaluateExpression(expression, frame?.callFrameId);
+		return {
+			result: remoteObjectToString(value),
+			type: variableType(value),
+			variablesReference: value?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(value, frame?.callFrameId)) : 0,
+			...(value && isArrayLikeRemoteObject(value) && value.size !== undefined ? { indexedVariables: value.size } : {}),
+		};
+	}
+
+	async #completions(args: DapBody): Promise<DapBody> {
+		const context = completionContextFromArgs(args);
+		const frame = this.#frameFromArgs(args);
+		const targets = context.receiverExpression ? await this.#memberCompletions(context, frame) : await this.#scopeAndGlobalCompletions(context, frame);
+		return { targets };
+	}
+
+	#frameFromArgs(args: DapBody): InspectorCallFrame | undefined {
+		const frameId = numberArg(args.frameId);
+		return frameId ? this.#frames[frameId - 1] : this.#frames[0];
+	}
+
+	async #memberCompletions(context: CompletionContext, frame: InspectorCallFrame | undefined): Promise<CompletionItem[]> {
+		const expression = context.receiverExpression;
+		if (!expression) return [];
+		const value = await this.#evaluateCompletionExpression(expression, frame).catch(() => undefined);
+		if (!value?.objectId) return [];
+		const properties = await this.#propertiesForObject(value.objectId).catch(() => []);
+		return this.#completionItemsFromProperties(properties, context);
+	}
+
+	async #scopeAndGlobalCompletions(context: CompletionContext, frame: InspectorCallFrame | undefined): Promise<CompletionItem[]> {
+		const properties = new Map<string, InspectorRemoteObject | undefined>();
+		for (const scope of frame?.scopeChain ?? []) {
+			if (!scope.object.objectId) continue;
+			this.#recordCompletionProperties(properties, await this.#propertiesForObject(scope.object.objectId).catch(() => []));
+		}
+		const global = await this.#evaluateExpression("globalThis", undefined, true).catch(() => undefined);
+		if (global?.objectId) {
+			this.#recordCompletionProperties(properties, await this.#propertiesForObject(global.objectId).catch(() => []));
+		}
+		return this.#completionItemsFromMap(properties, context);
+	}
+
+	async #evaluateCompletionExpression(expression: string, frame: InspectorCallFrame | undefined): Promise<InspectorRemoteObject | undefined> {
+		return await this.#evaluateExpression(expression, frame?.callFrameId, true);
+	}
+
+	async #propertiesForObject(objectId: string): Promise<InspectorProperty[]> {
+		const result = await this.#requiredInspector().send<{ properties?: InspectorProperty[] }>("Runtime.getProperties", {
+			objectId,
+			ownProperties: false,
+			generatePreview: true,
+		});
+		return result.properties ?? [];
+	}
+
+	#completionItemsFromProperties(properties: InspectorProperty[], context: CompletionContext): CompletionItem[] {
+		const mapped = new Map<string, InspectorRemoteObject | undefined>();
+		this.#recordCompletionProperties(mapped, properties);
+		return this.#completionItemsFromMap(mapped, context);
+	}
+
+	#recordCompletionProperties(target: Map<string, InspectorRemoteObject | undefined>, properties: InspectorProperty[]): void {
+		for (const property of properties) {
+			if (property.name.length === 0 || target.has(property.name)) continue;
+			target.set(property.name, property.value);
+		}
+	}
+
+	#completionItemsFromMap(properties: Map<string, InspectorRemoteObject | undefined>, context: CompletionContext): CompletionItem[] {
+		return Array.from(properties.entries())
+			.filter(([label]) => context.prefix.length === 0 || label.startsWith(context.prefix))
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([label, value]) => {
+				const type = variableType(value);
+				return {
+					label,
+					...(type ? { type } : {}),
+					start: context.start,
+					length: context.length,
+					sortText: label,
+				};
+			});
 	}
 
 	#loadedSources(): DapBody {
 		const sources = Array.from(this.#scriptsByUrl.values()).flatMap((script) => [script.url, ...(script.sourceMap?.sources() ?? [])]);
 		return {
 			sources: sources.map((source) => sourceFromPath(source)).filter((source): source is DapSource => source !== undefined),
+		};
+	}
+
+	#modules(args: DapBody): DapBody {
+		const modules = Array.from(this.#scriptsById.values()).map((script) => {
+			const source = sourceFromPath(script.url);
+			const scriptPath = source?.path ?? script.url;
+			return {
+				id: script.scriptId,
+				name: source?.name ?? script.url ?? `script ${script.scriptId}`,
+				...(scriptPath ? { path: scriptPath } : {}),
+				isUserCode: Boolean(script.url),
+			};
+		});
+		const start = numberArg(args.startModule) ?? 0;
+		const count = numberArg(args.moduleCount);
+		return {
+			modules: count === undefined ? modules.slice(start) : modules.slice(start, start + count),
+			totalModules: modules.length,
 		};
 	}
 
@@ -1776,12 +2247,14 @@ class BunDebugAdapter {
 		return this.#inspector;
 	}
 
-	#variableHandleFromRemoteObject(value: InspectorRemoteObject): VariableHandle {
+	#variableHandleFromRemoteObject(value: InspectorRemoteObject, frameId?: string, isScope = false): VariableHandle {
 		return {
 			objectId: value.objectId,
 			type: value.type,
 			subtype: value.subtype,
 			size: value.size,
+			frameId,
+			isScope,
 		};
 	}
 
@@ -1806,6 +2279,7 @@ class BunDebugAdapter {
 		this.#scriptsById.set(script.scriptId, script);
 		if (script.url) this.#scriptsByUrl.set(script.url, script);
 		void this.#rebindBreakpointsForScript(script);
+		void this.#rebindFunctionBreakpointsForLoadedScripts();
 	}
 
 	#handleBreakpointResolved(params: unknown): void {
@@ -1821,6 +2295,8 @@ class BunDebugAdapter {
 			columnNumber: numberArg(location.columnNumber),
 		};
 		entry.verified = true;
+		const functionEntry = this.#functionBreakpoints.find((candidate) => candidate.entry === entry);
+		if (functionEntry) this.#syncFunctionBreakpoint(functionEntry);
 		this.#sendEvent("breakpoint", { reason: "changed", breakpoint: this.#toDapBreakpoint(entry) });
 	}
 

@@ -4,6 +4,7 @@ import type {
 	DapBreakpoint,
 	DapCapabilities,
 	DapEventMessage,
+	DapFunctionBreakpoint,
 	DapRequestMessage,
 	DapResponseMessage,
 	DapScope,
@@ -25,6 +26,16 @@ interface BreakpointRecord {
 	line: number;
 	condition?: string;
 	hitCondition?: string;
+}
+
+interface FunctionBreakpointRecord {
+	verified: boolean;
+	name: string;
+	condition?: string;
+	hitCondition?: string;
+	message?: string;
+	line?: number;
+	source?: { name?: string; path?: string };
 }
 
 interface SessionSummary {
@@ -60,6 +71,7 @@ interface SessionState {
 	threadId?: number;
 	topFrame?: DapStackFrame;
 	breakpoints: Map<string, BreakpointRecord[]>;
+	functionBreakpoints: FunctionBreakpointRecord[];
 	capabilities?: DapCapabilities;
 }
 
@@ -292,6 +304,8 @@ class DapClient {
 
 export class DapSessionManager {
 	#pendingBreakpoints = new Map<string, BreakpointRecord[]>();
+	#pendingFunctionBreakpoints: FunctionBreakpointRecord[] = [];
+	#pendingExceptionFilters: string[] = [];
 	#session?: SessionState;
 	#nextSessionId = 1;
 
@@ -309,6 +323,7 @@ export class DapSessionManager {
 			ownerId: options.ownerId,
 			status: "configuring",
 			breakpoints: new Map(),
+			functionBreakpoints: [],
 		};
 		this.#session = session;
 		try {
@@ -347,6 +362,7 @@ export class DapSessionManager {
 			ownerId: options.ownerId,
 			status: "configuring",
 			breakpoints: new Map(),
+			functionBreakpoints: [],
 		};
 		this.#session = session;
 		try {
@@ -409,6 +425,35 @@ export class DapSessionManager {
 		if (session) await this.#sendBreakpoints(session, sourcePath, next, timeoutMs);
 	}
 
+	async setFunctionBreakpoint(
+		name: string,
+		condition?: string,
+		_signal?: AbortSignal,
+		timeoutMs = 30_000,
+		target?: { ownerId?: string },
+		options?: { hitCondition?: string },
+	): Promise<{ snapshot?: SessionSummary; breakpoints: FunctionBreakpointRecord[] }> {
+		const next = this.#pendingFunctionBreakpoints.filter((entry) => entry.name !== name);
+		next.push({ verified: false, name, condition, hitCondition: options?.hitCondition });
+		next.sort((left, right) => left.name.localeCompare(right.name));
+		this.#pendingFunctionBreakpoints = next;
+		const session = this.#sessionForTarget(target);
+		if (session) await this.#sendFunctionBreakpoints(session, next, timeoutMs);
+		return { snapshot: session ? this.#summary(session) : undefined, breakpoints: session?.functionBreakpoints ?? this.#pendingFunctionBreakpoints };
+	}
+
+	async setExceptionBreakpoints(
+		filters: string[],
+		_signal?: AbortSignal,
+		timeoutMs = 30_000,
+		target?: { ownerId?: string },
+	): Promise<{ breakpoints?: DapBreakpoint[] }> {
+		this.#pendingExceptionFilters = filters;
+		const session = this.#sessionForTarget(target);
+		if (!session) return {};
+		return await this.#sendExceptionBreakpoints(session, filters, timeoutMs);
+	}
+
 	async terminate(_signal?: AbortSignal, timeoutMs = 30_000, target?: { ownerId?: string }): Promise<SessionSummary> {
 		const session = this.#sessionForTarget(target);
 		if (!session) throw new Error("No active debug session");
@@ -436,6 +481,11 @@ export class DapSessionManager {
 	async variables(variablesReference: number, _signal?: AbortSignal, timeoutMs = 30_000, target?: { ownerId?: string }): Promise<{ variables: DapVariable[] }> {
 		const session = this.#requiredSession(target);
 		return await session.client.request("variables", { variablesReference }, timeoutMs);
+	}
+
+	capabilities(target?: { ownerId?: string }): DapCapabilities {
+		const session = this.#requiredSession(target);
+		return session.capabilities ?? {};
 	}
 
 	async evaluate(
@@ -516,6 +566,8 @@ export class DapSessionManager {
 		for (const [sourcePath, breakpoints] of this.#pendingBreakpoints) {
 			await this.#sendBreakpoints(session, sourcePath, breakpoints, timeoutMs);
 		}
+		await this.#sendFunctionBreakpoints(session, this.#pendingFunctionBreakpoints, timeoutMs);
+		await this.#sendExceptionBreakpoints(session, this.#pendingExceptionFilters, timeoutMs);
 	}
 
 	async #sendBreakpoints(session: SessionState, sourcePath: string, breakpoints: BreakpointRecord[], timeoutMs: number): Promise<void> {
@@ -534,6 +586,36 @@ export class DapSessionManager {
 		const mapped = breakpoints.map((entry, index) => ({ ...entry, verified: response.breakpoints?.[index]?.verified ?? entry.verified }));
 		session.breakpoints.set(sourcePath, mapped);
 		this.#pendingBreakpoints.set(sourcePath, mapped);
+	}
+
+	async #sendFunctionBreakpoints(session: SessionState, breakpoints: FunctionBreakpointRecord[], timeoutMs: number): Promise<void> {
+		const response = await session.client.request<{ breakpoints?: DapBreakpoint[] }>(
+			"setFunctionBreakpoints",
+			{
+				breakpoints: breakpoints.map<DapFunctionBreakpoint>((entry) => ({
+					name: entry.name,
+					...(entry.condition ? { condition: entry.condition } : {}),
+					...(entry.hitCondition ? { hitCondition: entry.hitCondition } : {}),
+				})),
+			},
+			timeoutMs,
+		);
+		const mapped = breakpoints.map((entry, index) => {
+			const breakpoint = response.breakpoints?.[index];
+			return {
+				...entry,
+				verified: breakpoint?.verified ?? entry.verified,
+				message: breakpoint?.message,
+				line: breakpoint?.line,
+				source: breakpoint?.source,
+			};
+		});
+		session.functionBreakpoints = mapped;
+		this.#pendingFunctionBreakpoints = mapped;
+	}
+
+	async #sendExceptionBreakpoints(session: SessionState, filters: string[], timeoutMs: number): Promise<{ breakpoints?: DapBreakpoint[] }> {
+		return await session.client.request<{ breakpoints?: DapBreakpoint[] }>("setExceptionBreakpoints", { filters }, timeoutMs);
 	}
 
 	async #waitForStopOrTermination(session: SessionState, timeoutMs: number): Promise<void> {
@@ -581,7 +663,7 @@ export class DapSessionManager {
 			column: session.topFrame?.column,
 			breakpointFiles: session.breakpoints.size,
 			breakpointCount: breakpoints.length,
-			functionBreakpointCount: 0,
+			functionBreakpointCount: session.functionBreakpoints.length,
 			outputBytes: Buffer.byteLength(session.client.output, "utf8"),
 			outputTruncated: false,
 			needsConfigurationDone: session.capabilities?.supportsConfigurationDoneRequest === true,

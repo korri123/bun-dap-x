@@ -70,7 +70,7 @@ bun --inspect=127.0.0.1:6499 ./src/index.ts
 }
 ```
 
-Attach also accepts `inspectorUrl`, or `host`, `port`, and `path` fields. The default host is `127.0.0.1`; the default port is `6499`.
+Attach also accepts `inspectorUrl`, or `host`, `port`, and `path` fields. The default host is `127.0.0.1`; the default port is `6499`. `path` is still required unless you pass a full `url`/`inspectorUrl`, because Bun's Inspector HTTP endpoint does not expose the per-process WebSocket path.
 
 ## VS Code
 
@@ -183,20 +183,23 @@ dap.adapters["bun-dap-x"] = {
 
 - Launch Bun programs and attach to Bun Inspector WebSocket sessions.
 - Source breakpoints, including pending breakpoints set before launch.
+- Function breakpoints for unique loaded static function declarations/assignments found by source scanning.
 - Conditional breakpoints, hit-count breakpoints, and logpoints.
+- Exception breakpoints for Bun Inspector's uncaught/all pause modes.
 - Continue, pause, step over, step in, step out, terminate, and disconnect.
 - Stack traces, scopes, variables, hover evaluation, and REPL evaluation.
 - Debuggee stdout, stderr, and console output as DAP output events.
 - Loaded sources and breakpoint-location queries.
+- Set-variable, completion, and modules requests backed by Bun Inspector state.
 - Best-effort Bun source-map support for TypeScript/TSX/MTS/CTS/JSX sources, imported files, and generated lines that do not map directly back to source.
 
 ## Limitations
 
 - One debug target and one DAP thread are exposed per adapter process.
-- Attach requires a Bun Inspector WebSocket URL, or explicit `host`/`port`/`path`; PID attach and inspector discovery are not implemented.
+- Attach requires a Bun Inspector WebSocket URL, or explicit `host`/`port`/`path`; PID attach and host/port-only discovery are not supported because Bun 1.3.14 returns only version metadata from `/json/version`, returns 404 for `/json` and `/json/list`, and rejects WebSocket connections without the exact inspector path.
 - The adapter does not provide a terminal for debuggee stdin; launched processes run with stdin ignored.
-- Function, data, instruction, and exception breakpoints are not implemented.
-- Restart, set-variable, completions, modules, memory, and disassembly requests are not implemented.
+- Data and instruction breakpoints are not implemented because Bun Inspector does not expose data watchpoints or instruction-address breakpoints.
+- Restart, memory, and disassembly requests are not implemented; memory and disassembly remain unsupported because Bun Inspector does not expose safe byte-read/disassembly backing.
 - Source-map and source-level stepping behavior is best-effort and follows Bun Inspector output.
 
 ## Development

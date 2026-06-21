@@ -73,6 +73,13 @@ export interface DapFunctionBreakpoint {
 	hitCondition?: string;
 }
 
+export interface DapExceptionBreakpointFilter {
+	filter: string;
+	label: string;
+	description?: string;
+	default?: boolean;
+}
+
 export interface DapInitializeArguments {
 	clientID?: string;
 	clientName?: string;
@@ -107,6 +114,7 @@ export interface DapCapabilities {
 	supportsWriteMemoryRequest?: boolean;
 	supportsModulesRequest?: boolean;
 	supportsLoadedSourcesRequest?: boolean;
+	exceptionBreakpointFilters?: DapExceptionBreakpointFilter[];
 	supportsExceptionInfoRequest?: boolean;
 	supportsInstructionBreakpoints?: boolean;
 	supportsDataBreakpoints?: boolean;
@@ -293,6 +301,44 @@ export interface DapVariable {
 
 export interface DapVariablesResponse {
 	variables: DapVariable[];
+}
+
+export interface DapSetVariableArguments {
+	variablesReference: number;
+	name: string;
+	value: string;
+	format?: Record<string, unknown>;
+}
+
+export interface DapSetVariableResponse {
+	value: string;
+	type?: string;
+	variablesReference?: number;
+	namedVariables?: number;
+	indexedVariables?: number;
+}
+
+export interface DapCompletionsArguments {
+	frameId?: number;
+	text: string;
+	column: number;
+	line?: number;
+}
+
+export interface DapCompletionItem {
+	label: string;
+	text?: string;
+	type?: string;
+	start?: number;
+	length?: number;
+	sortText?: string;
+	detail?: string;
+	selectionStart?: number;
+	selectionLength?: number;
+}
+
+export interface DapCompletionsResponse {
+	targets: DapCompletionItem[];
 }
 
 export interface DapDisassembleArguments {
