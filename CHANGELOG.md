@@ -2,6 +2,13 @@
 
 All notable changes are managed by release-please from Conventional Commit history.
 
+## [0.2.2](https://github.com/korri123/bun-dap-x/compare/v0.2.1...v0.2.2) (2026-06-21)
+
+
+### Bug Fixes
+
+* bun test timeout issues ([6ff330d](https://github.com/korri123/bun-dap-x/commit/6ff330d738a93c9901e3bebf2b619c9c8c0d07b1))
+
 ## [0.2.1](https://github.com/korri123/bun-dap-x/compare/v0.2.0...v0.2.1) (2026-06-21)
 
 
