@@ -2,6 +2,13 @@
 
 All notable changes are managed by release-please from Conventional Commit history.
 
+## [0.2.3](https://github.com/korri123/bun-dap-x/compare/v0.2.2...v0.2.3) (2026-06-21)
+
+
+### Bug Fixes
+
+* bad build script ([493094c](https://github.com/korri123/bun-dap-x/commit/493094c5c3efa10b8221b73c1ca224ad4756bcba))
+
 ## [0.2.2](https://github.com/korri123/bun-dap-x/compare/v0.2.1...v0.2.2) (2026-06-21)
 
 
