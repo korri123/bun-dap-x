@@ -219,3 +219,15 @@ Additional maintenance scripts:
 bun run knip
 bun run jscpd
 ```
+
+## Versioning and releases
+
+Releases are managed by release-please from Conventional Commits.
+
+- `fix: ...` creates a patch release.
+- `feat: ...` creates a minor release.
+- `feat!: ...` or a `BREAKING CHANGE:` footer creates a major release.
+
+On pushes to `main`, `.github/workflows/release.yml` runs the same validation as CI, then release-please opens or updates a release PR. Merging that PR bumps `package.json`, updates `CHANGELOG.md` and `.release-please-manifest.json`, creates a `vX.Y.Z` GitHub release, and uploads the npm-compatible package tarball as a release asset.
+
+The workflow does not publish to npm yet. To enable npm later, add an `NPM_TOKEN` repository secret and a `npm publish --provenance --access public` step guarded by `steps.release.outputs.release_created`.
