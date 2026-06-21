@@ -22,6 +22,7 @@
 	},
 	"homepage": "https://github.com/korri123/bun-dap-x#readme",
 	"files": [
+		"bin",
 		"src",
 		"README.md",
 		"CHANGELOG.md",
@@ -33,7 +34,7 @@
 	"type": "module",
 	"module": "./src/index.ts",
 	"bin": {
-		"bun-dap-x": "./src/cli.ts"
+		"bun-dap-x": "./bin/bun-dap-x"
 	},
 	"exports": {
 		".": "./src/index.ts"
