@@ -108,6 +108,32 @@ describe("standalone Bun DAP adapter", () => {
 		}
 	}, 45_000);
 
+	it("emulates stopOnEntry without Bun break-line injection", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-stop-on-entry-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-stop-on-entry-${Bun.randomUUIDv7()}`;
+		try {
+			const program = path.join(cwd, "entry.ts");
+			await Bun.write(program, ["// leading comment", 'const marker = "entry";', "console.log(marker);", ""].join("\n"));
+			const realProgram = await fs.realpath(program);
+
+			const snapshot = await manager.launch(
+				{ ownerId, adapter: requireBunAdapter(cwd), program, cwd, extraLaunchArguments: { stopOnEntry: true } },
+				undefined,
+				30_000,
+			);
+
+			expect(snapshot.status).toBe("stopped");
+			expect(snapshot.stopReason).toBe("entry");
+			expect(snapshot.source?.path).toBe(realProgram);
+			expect(snapshot.line).toBe(2);
+			expect((await manager.continue(undefined, 10_000, { ownerId })).state).toBe("terminated");
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
 	it("attaches to a Bun inspector target and evaluates locals at a breakpoint", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-attach-"));
 		const notify = createInspectNotifyServer();
@@ -833,7 +859,7 @@ describe("standalone Bun DAP adapter", () => {
 							ownerId,
 						})
 					).evaluation?.result,
-				).toBe("1:beta:4");
+				).toBe(testCase.action === "over" ? "2:gamma:12" : "1:beta:4");
 			} finally {
 				await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
 				await fs.rm(cwd, { recursive: true, force: true });
@@ -886,9 +912,9 @@ describe("standalone Bun DAP adapter", () => {
 			{
 				ownerPrefix: "plain",
 				condition: undefined,
-				expectedIndex: "0",
-				expectedSample: "alpha",
-				expectedTotal: "0",
+				expectedIndex: "1",
+				expectedSample: "beta",
+				expectedTotal: "4",
 			},
 			{
 				ownerPrefix: "condition",
@@ -1110,6 +1136,53 @@ describe("standalone Bun DAP adapter", () => {
 			expect(snapshot.frameName).toBe("module code");
 			expect(snapshot.line).toBe(23);
 			expect((await manager.evaluate("samples.length", "repl", undefined, undefined, 10_000, { ownerId })).evaluation?.result).toBe("3");
+		} finally {
+			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 45_000);
+
+	it("does not stop before the previous top-level lexical initialization", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "bun-dap-x-top-level-lexical-"));
+		const manager = new DapSessionManager();
+		const ownerId = `bun-dap-top-level-lexical-${Bun.randomUUIDv7()}`;
+		try {
+			const program = path.join(cwd, "top-level-lexical.ts");
+			await Bun.write(
+				program,
+				[
+					'const label = "bun-dap-repro";',
+					"const values = [2, 3, 5];",
+					"const total = values.reduce((sum, value) => sum + value, 0);",
+					"const payload = { label, values, total };",
+					"console.log(`$" + "{payload.label}:$" + "{payload.total}`);",
+					"",
+				].join("\n"),
+			);
+			await manager.setBreakpoint(program, 5, undefined, undefined, 10_000, { ownerId });
+
+			const snapshot = await manager.launch({ ownerId, adapter: requireBunAdapter(cwd), program, cwd }, undefined, 30_000);
+
+			expect(snapshot.status).toBe("stopped");
+			expect(snapshot.stopReason).toBe("breakpoint");
+			expect(snapshot.frameName).toBe("module code");
+			expect(snapshot.line).toBe(5);
+			expect((await manager.evaluate("total", "repl", undefined, undefined, 10_000, { ownerId })).evaluation?.result).toBe("10");
+			const payload = await manager.evaluate("payload", "repl", undefined, undefined, 10_000, { ownerId });
+			expect(payload.evaluation?.result).toBe("Object");
+			expect(payload.evaluation?.variablesReference ?? 0).toBeGreaterThan(0);
+			const scopes = await manager.scopes(snapshot.frameId!, undefined, 10_000, { ownerId });
+			const lexicalScope = scopes.scopes.find((scope) => scope.name === "globalLexicalEnvironment");
+			expect(lexicalScope?.variablesReference ?? 0).toBeGreaterThan(0);
+			const lexicalVariables = await manager.variables(lexicalScope!.variablesReference, undefined, 10_000, { ownerId });
+			const variablesByName = new Map(lexicalVariables.variables.map((variable) => [variable.name, variable]));
+			expect(variablesByName.get("label")?.value).toBe("bun-dap-repro");
+			expect(variablesByName.get("values")?.value).toBe("Array");
+			expect(variablesByName.get("total")?.value).toBe("10");
+			expect(variablesByName.get("payload")?.value).toBe("Object");
+
+			const stepped = await manager.stepOver(undefined, 10_000, { ownerId });
+			expect(stepped.state).toBe("terminated");
 		} finally {
 			await manager.terminate(undefined, 10_000, { ownerId }).catch(() => undefined);
 			await fs.rm(cwd, { recursive: true, force: true });

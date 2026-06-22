@@ -51,6 +51,7 @@
 		"prepack": "bun run build"
 	},
 	"dependencies": {
+		"oxc-parser": "^0.137.0",
 		"source-map-js": "^1.2.1"
 	},
 	"devDependencies": {

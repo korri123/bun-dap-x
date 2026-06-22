@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
 import type { Subprocess } from "bun";
+import { type ParserOptions, parseSync } from "oxc-parser";
 import type { LineRange, MappedPosition, RawSourceMap } from "source-map-js";
 import { SourceMapConsumer } from "source-map-js";
 import type {
@@ -136,6 +137,8 @@ interface VariableHandle {
 	size?: number;
 	frameId?: string;
 	isScope?: boolean;
+	scopeName?: string;
+	scopeType?: string;
 }
 
 interface CompletionContext {
@@ -364,6 +367,15 @@ function nextSourceStepLine(sourcePath: string | undefined, afterLine: number): 
 		if (isSourceStepCandidate(lines[index] ?? "")) return index + 1;
 	}
 	return undefined;
+}
+
+function launchEntryCandidateLines(sourcePath: string | undefined, limit: number): number[] {
+	const lines = sourceLines(sourcePath);
+	const candidates: number[] = [];
+	for (let index = 0; index < lines.length && candidates.length < limit; index++) {
+		if (isSourceMapSentinelCandidate(lines[index] ?? "")) candidates.push(index + 1);
+	}
+	return candidates;
 }
 
 function sourceEnclosingLoopLine(sourcePath: string | undefined, line: number): number | undefined {
@@ -723,6 +735,181 @@ function remoteObjectToString(value: InspectorRemoteObject | undefined): string 
 function isIdentifierName(value: string): boolean {
 	return /^[A-Za-z_$][\w$]*$/.test(value);
 }
+function astNodeType(value: unknown): string | undefined {
+	return isRecord(value) && typeof value.type === "string" ? value.type : undefined;
+}
+
+function astChild(value: unknown, key: string): unknown {
+	return isRecord(value) ? value[key] : undefined;
+}
+
+function astChildren(value: unknown, key: string): unknown[] {
+	const children = astChild(value, key);
+	return Array.isArray(children) ? children : [];
+}
+
+function lineStartsForText(text: string): number[] {
+	const starts = [0];
+	for (let index = 0; index < text.length; index++) {
+		if (text.charCodeAt(index) === 10) starts.push(index + 1);
+	}
+	return starts;
+}
+
+function lineNumberForOffset(lineStarts: readonly number[], offset: unknown): number | undefined {
+	if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0) return undefined;
+	let low = 0;
+	let high = lineStarts.length - 1;
+	while (low <= high) {
+		const middle = Math.floor((low + high) / 2);
+		if ((lineStarts[middle] ?? 0) <= offset) low = middle + 1;
+		else high = middle - 1;
+	}
+	return high + 1;
+}
+
+function astEndLine(value: unknown, lineStarts: readonly number[]): number | undefined {
+	return lineNumberForOffset(lineStarts, astChild(value, "end"));
+}
+
+function previousNonEmptyLine(lines: readonly string[], beforeLine: number): number | undefined {
+	for (let index = Math.max(beforeLine - 2, 0); index >= 0; index--) {
+		if ((lines[index] ?? "").trim().length > 0) return index + 1;
+	}
+	return undefined;
+}
+
+function appendBindingPatternNames(pattern: unknown, names: string[]): void {
+	switch (astNodeType(pattern)) {
+		case "Identifier": {
+			const name = astChild(pattern, "name");
+			if (typeof name === "string") names.push(name);
+			return;
+		}
+		case "RestElement":
+			appendBindingPatternNames(astChild(pattern, "argument"), names);
+			return;
+		case "AssignmentPattern":
+			appendBindingPatternNames(astChild(pattern, "left"), names);
+			return;
+		case "ArrayPattern":
+			for (const element of astChildren(pattern, "elements")) {
+				appendBindingPatternNames(element, names);
+			}
+			return;
+		case "ObjectPattern":
+			for (const property of astChildren(pattern, "properties")) {
+				if (astNodeType(property) === "RestElement") appendBindingPatternNames(astChild(property, "argument"), names);
+				else appendBindingPatternNames(astChild(property, "value"), names);
+			}
+			return;
+		default:
+			return;
+	}
+}
+
+function lexicalBindingNamesFromStatement(statement: unknown): string[] {
+	const declaration = astNodeType(statement)?.startsWith("Export") ? astChild(statement, "declaration") : statement;
+	const names: string[] = [];
+	switch (astNodeType(declaration)) {
+		case "ClassDeclaration":
+			appendBindingPatternNames(astChild(declaration, "id"), names);
+			return names;
+		case "VariableDeclaration": {
+			const kind = astChild(declaration, "kind");
+			if (kind !== "const" && kind !== "let") return [];
+			for (const declarator of astChildren(declaration, "declarations")) {
+				appendBindingPatternNames(astChild(declarator, "id"), names);
+			}
+			return names;
+		}
+		default:
+			return [];
+	}
+}
+
+function parserOptionsForSource(sourcePath: string): ParserOptions {
+	const extension = path.extname(sourcePath).toLowerCase();
+	const lang = sourcePath.endsWith(".d.ts")
+		? "dts"
+		: extension === ".tsx"
+			? "tsx"
+			: extension === ".jsx"
+				? "jsx"
+				: extension === ".ts" || extension === ".mts" || extension === ".cts"
+					? "ts"
+					: "js";
+	return { lang, sourceType: "unambiguous" };
+}
+
+function parseSourceAst(sourcePath: string, text: string): unknown {
+	return parseSync(sourcePath, text, parserOptionsForSource(sourcePath));
+}
+
+function parsedSourceAstForPath(sourcePath: string | undefined): { text: string; parsed: unknown; lineStarts: number[] } | undefined {
+	if (!sourcePath || !path.isAbsolute(sourcePath)) return undefined;
+	let text: string;
+	try {
+		text = fs.readFileSync(sourcePath, "utf8");
+	} catch {
+		return undefined;
+	}
+	try {
+		return { text, parsed: parseSourceAst(sourcePath, text), lineStarts: lineStartsForText(text) };
+	} catch {
+		return undefined;
+	}
+}
+
+function findLexicalBindingNamesEndingOnLine(node: unknown, line: number, lineStarts: readonly number[]): string[] {
+	const names = lexicalBindingNamesFromStatement(node);
+	if (names.length > 0 && astEndLine(node, lineStarts) === line) return names;
+	if (Array.isArray(node)) {
+		for (const child of node) {
+			const childNames = findLexicalBindingNamesEndingOnLine(child, line, lineStarts);
+			if (childNames.length > 0) return childNames;
+		}
+		return [];
+	}
+	if (!isRecord(node)) return [];
+	for (const [key, value] of Object.entries(node)) {
+		if (key === "start" || key === "end") continue;
+		const childNames = findLexicalBindingNamesEndingOnLine(value, line, lineStarts);
+		if (childNames.length > 0) return childNames;
+	}
+	return [];
+}
+
+function lexicalBindingNamesBeforeLine(sourcePath: string | undefined, line: number): string[] {
+	if (line <= 1) return [];
+	const source = parsedSourceAstForPath(sourcePath);
+	if (!source) return [];
+	const previousLine = previousNonEmptyLine(source.text.split(/\r?\n/), line);
+	if (!previousLine) return [];
+	return findLexicalBindingNamesEndingOnLine(source.parsed, previousLine, source.lineStarts);
+}
+
+function topLevelLexicalBindingNamesBeforeLine(sourcePath: string | undefined, line: number): string[] {
+	if (line <= 1) return [];
+	const source = parsedSourceAstForPath(sourcePath);
+	if (!source) return [];
+	const names: string[] = [];
+	const seen = new Set<string>();
+	for (const statement of astChildren(astChild(source.parsed, "program"), "body")) {
+		const endLine = astEndLine(statement, source.lineStarts);
+		if (endLine === undefined || endLine >= line) continue;
+		for (const name of lexicalBindingNamesFromStatement(statement)) {
+			if (seen.has(name)) continue;
+			seen.add(name);
+			names.push(name);
+		}
+	}
+	return names;
+}
+
+function isTemporalDeadZoneError(value: InspectorRemoteObject | undefined): boolean {
+	return (value?.type === "error" || value?.subtype === "error") && /before initialization/i.test(remoteObjectToString(value));
+}
 
 function completionContextFromArgs(args: DapBody): CompletionContext {
 	const text = typeof args.text === "string" ? args.text : "";
@@ -797,6 +984,32 @@ function mergeEnv(extra: Record<string, string | undefined>, strict: boolean): R
 		if (typeof value === "string") clean[key] = value;
 	}
 	return clean;
+}
+
+function resolveExistingSourceArg(cwd: string, value: string): string | undefined {
+	if (value.startsWith("-")) return undefined;
+	const resolved = path.isAbsolute(value) ? value : path.resolve(cwd, value);
+	try {
+		if (!fs.statSync(resolved).isFile()) return undefined;
+		return canonicalizeSourcePath(resolved);
+	} catch {
+		return undefined;
+	}
+}
+
+function bunRuntimeEntrySourcePath(cwd: string, programArgs: string[]): string | undefined {
+	const [command, ...rest] = programArgs;
+	const candidates = command === "test" || command === "run" ? rest : programArgs;
+	for (const candidate of candidates) {
+		const sourcePath = resolveExistingSourceArg(cwd, candidate);
+		if (sourcePath) return sourcePath;
+	}
+	return undefined;
+}
+
+function launchEntrySourcePath(program: string, cwd: string, programIsRuntime: boolean, programArgs: string[]): string | undefined {
+	if (programIsRuntime) return bunRuntimeEntrySourcePath(cwd, programArgs);
+	return canonicalizeSourcePath(path.isAbsolute(program) ? program : path.resolve(cwd, program));
 }
 
 async function getFreeTcpPort(): Promise<number> {
@@ -1009,6 +1222,7 @@ class BunDebugAdapter {
 	#placeholderBreakpointsByInspectorId = new Map<string, StoredBreakpoint>();
 	#temporaryBreakpointIds = new Set<string>();
 	#temporaryInstalledBreakpoints: TemporaryInstalledBreakpoint[] = [];
+	#scriptRebindQueue: Promise<void> = Promise.resolve();
 	#lastStepLocationOverride?: {
 		scriptId: string;
 		lineNumber: number;
@@ -1017,15 +1231,19 @@ class BunDebugAdapter {
 		column: number;
 	};
 	#pendingStepLocationOverride?: { sourcePath: string; line: number; column: number };
+	#pendingTerminalSourceStep?: StepInTarget;
 	#pendingLoopSourceStep?: StepInTarget;
 	#stepDisabledBreakpoints: StoredBreakpoint[] = [];
+	#entryBreakpointIds = new Set<string>();
+	#entryBreakpointTargets = new Map<string, StepInTarget>();
+	#suppressLaunchEntryStop = true;
+	#launchEntrySourcePath?: string;
+	#enableBreakpointLexicalCorrection = false;
+	#pendingBreakpointCorrection?: StoredBreakpoint;
 	#lastStopBreakpointId?: string;
 	#nextBreakpointId = 1;
-	#configurationDone = false;
 	#terminatedSent = false;
 	#exceptionPauseState: InspectorPauseOnExceptionsState = "none";
-	#suppressInitialPause = false;
-	#deferredInitialPause: unknown;
 	#testTimeoutPolicy: TestTimeoutPolicy = "auto";
 
 	async run(): Promise<void> {
@@ -1238,9 +1456,12 @@ class BunDebugAdapter {
 		const inspectorUrl = `ws://127.0.0.1:${inspectorPort}/${crypto.randomUUID()}`;
 		const notify = createTcpNotifyServer();
 		this.#notifyServer = notify;
-		this.#suppressInitialPause = args.stopOnEntry !== true;
-		this.#deferredInitialPause = undefined;
-		env.BUN_INSPECT = `${inspectorUrl}?break=1`;
+		const launchEntryPath = launchEntrySourcePath(program, cwd, programIsRuntime, programArgs);
+		this.#rememberFunctionSourcePath(launchEntryPath, cwd);
+		this.#launchEntrySourcePath = launchEntryPath;
+		this.#suppressLaunchEntryStop = args.stopOnEntry !== true;
+		this.#enableBreakpointLexicalCorrection = false;
+		env.BUN_INSPECT = `${inspectorUrl}?wait=1`;
 		env.BUN_INSPECT_NOTIFY = notify.url;
 		env.FORCE_COLOR = env.FORCE_COLOR ?? "1";
 		env.BUN_QUIET_DEBUG_LOGS = "1";
@@ -1282,6 +1503,9 @@ class BunDebugAdapter {
 	async #attach(args: DapBody): Promise<void> {
 		const program = stringArg(args.program);
 		this.#rememberFunctionSourcePath(program, stringArg(args.cwd) ?? process.cwd());
+		this.#launchEntrySourcePath = undefined;
+		this.#suppressLaunchEntryStop = false;
+		this.#enableBreakpointLexicalCorrection = true;
 		const disableTestTimeout = booleanArg(args.disableTestTimeout);
 		this.#testTimeoutPolicy = disableTestTimeout === true ? "required" : disableTestTimeout === false ? "off" : isLikelyBunTestPath(program) ? "auto" : "off";
 		const attachUrl = stringArg(args.url) ?? stringArg(args.inspectorUrl) ?? this.#buildAttachUrl(args);
@@ -1307,6 +1531,7 @@ class BunDebugAdapter {
 		inspector.on("Debugger.resumed", () => {
 			this.#frames = [];
 			this.#lastStepLocationOverride = undefined;
+			this.#pendingTerminalSourceStep = undefined;
 			this.#sendEvent("continued", { threadId: THREAD_ID, allThreadsContinued: true });
 		});
 		inspector.on("Runtime.consoleAPICalled", (params) => this.#handleConsole(params));
@@ -1323,16 +1548,12 @@ class BunDebugAdapter {
 	}
 
 	async #configurationDoneRequest(): Promise<void> {
-		this.#configurationDone = true;
 		const inspector = this.#requiredInspector();
 		await inspector.send("Debugger.setBreakpointsActive", { active: true });
 		await this.#disableBunTestTimeoutBeforeResume(inspector);
+		await this.#installLaunchEntryBreakpoints();
 		await inspector.send("Inspector.initialized");
 		await this.#rebindBreakpointsForLoadedScripts();
-		if (this.#suppressInitialPause && this.#deferredInitialPause !== undefined) {
-			this.#deferredInitialPause = undefined;
-			await inspector.send("Debugger.resume").catch(() => undefined);
-		}
 	}
 
 	async #disableBunTestTimeoutBeforeResume(inspector: InspectorConnection): Promise<void> {
@@ -1580,7 +1801,7 @@ class BunDebugAdapter {
 				entry.message = entry.message ?? toErrorMessage(error);
 			}
 		}
-		if (!loadedScript && breakpoint.line > 1) {
+		if (!loadedScript && breakpoint.line > 1 && sourceCanDriftBeforeLine(key, breakpoint.line)) {
 			await this.#installPendingSourceMapPlaceholder(entry).catch(() => undefined);
 		}
 		return entry;
@@ -1720,6 +1941,19 @@ class BunDebugAdapter {
 		return undefined;
 	}
 
+	async #breakpointStopNeedsLexicalCorrection(entry: StoredBreakpoint, frame: InspectorCallFrame): Promise<boolean> {
+		if (!this.#enableBreakpointLexicalCorrection) return false;
+		const stop = this.#sourceStopLocation(frame);
+		if (!stop?.sourcePath || !pathsLikelyMatch(stop.sourcePath, entry.sourceKey) || stop.line !== entry.request.line || entry.request.line <= 1) {
+			return false;
+		}
+		for (const name of lexicalBindingNamesBeforeLine(stop.sourcePath, stop.line)) {
+			const value = await this.#evaluateExpression(name, frame.callFrameId).catch(() => undefined);
+			if (isTemporalDeadZoneError(value)) return true;
+		}
+		return false;
+	}
+
 	#breakpointEntriesForLocation(location: InspectorLocation): StoredBreakpoint[] {
 		const entries: StoredBreakpoint[] = [];
 		for (const entry of this.#allBreakpointEntries()) {
@@ -1802,15 +2036,49 @@ class BunDebugAdapter {
 		}
 		this.#temporaryInstalledBreakpoints = [];
 		this.#temporaryBreakpointIds.clear();
+		this.#entryBreakpointIds.clear();
+		this.#entryBreakpointTargets.clear();
 		if (!inspector || ids.length === 0) return;
 		await Promise.allSettled(ids.map((id) => inspector.send("Debugger.removeBreakpoint", { breakpointId: id }).catch(() => undefined)));
+	}
+
+	async #setTemporaryEntryBreakpointBySource(sourcePath: string, line: number): Promise<void> {
+		const result = await this.#requiredInspector()
+			.send<InspectorSetBreakpointResult>("Debugger.setBreakpointByUrl", {
+				url: inspectorUrlForSource(sourcePath),
+				lineNumber: Math.max(line - 1, 0),
+				columnNumber: defaultColumnForSourceLine(sourcePath, line),
+			})
+			.catch(() => undefined);
+		if (!result?.breakpointId) return;
+		this.#temporaryBreakpointIds.add(result.breakpointId);
+		this.#entryBreakpointIds.add(result.breakpointId);
+		this.#entryBreakpointTargets.set(result.breakpointId, { sourcePath, line, column: defaultColumnForSourceLine(sourcePath, line) + 1 });
+	}
+
+	async #installLaunchEntryBreakpoints(): Promise<void> {
+		const sourcePath = this.#launchEntrySourcePath;
+		this.#launchEntrySourcePath = undefined;
+		if (!sourcePath) return;
+		const limit = 1;
+		for (const line of launchEntryCandidateLines(sourcePath, limit)) {
+			await this.#setTemporaryEntryBreakpointBySource(sourcePath, line);
+		}
 	}
 
 	async #sourceStepOver(): Promise<boolean> {
 		const current = this.#sourceStopLocation();
 		if (!current?.sourcePath || !path.isAbsolute(current.sourcePath)) return false;
 		const nextLine = nextSourceStepLine(current.sourcePath, current.line);
-		if (!nextLine) return false;
+		if (!nextLine) {
+			this.#pendingTerminalSourceStep = {
+				sourcePath: current.sourcePath,
+				line: current.line,
+				column: current.column,
+			};
+			await this.#requiredInspector().send("Debugger.stepNext");
+			return true;
+		}
 		if (sourceLineIsInsideLoop(current.sourcePath, current.line)) {
 			await this.#temporarilyDisableSourceBreakpointsAt(current.sourcePath, current.line, this.#frames[0]);
 			this.#pendingLoopSourceStep = {
@@ -1902,7 +2170,7 @@ class BunDebugAdapter {
 		const column = numberArg(args.column) ?? 1;
 		const endLine = numberArg(args.endLine) ?? line + 1;
 		const endColumn = numberArg(args.endColumn) ?? 1;
-		const canUseMappedFallback = script.sourceMap?.matchesSource(key) === true || sourceLineIsInsideLoop(key, line);
+		const canUseMappedFallback = script.sourceMap?.matchesSource(key) === true;
 		const sourceMapMovesStartLine = this.#sourceMapShouldMoveBreakpoint(script, { line, column }, key, Math.max(line - 1, 0));
 		let usedDirect = true;
 		let start = this.#generatedLocationForBreakpoint(script, { line, column }, key);
@@ -1954,12 +2222,13 @@ class BunDebugAdapter {
 			entry.inspectorId = undefined;
 		}
 		const options = breakpointOptions(entry.request);
-		const canUseSourceMapFallback = script.sourceMap?.matchesSource(entry.sourceKey) === true || sourceLineIsInsideLoop(entry.sourceKey, entry.request.line);
+		const canUseSourceMapFallback = script.sourceMap?.matchesSource(entry.sourceKey) === true;
+		const bindLocation = this.#generatedLocationForBreakpoint(script, entry.request, entry.sourceKey);
 		let directErrorMessage: string | undefined;
 		let result: InspectorSetBreakpointResult | undefined;
 		try {
 			result = await inspector.send<InspectorSetBreakpointResult>("Debugger.setBreakpoint", {
-				location: this.#generatedLocationForBreakpoint(script, entry.request, entry.sourceKey),
+				location: bindLocation,
 				...(options ? { options } : {}),
 			});
 			this.#applyBreakpointResult(entry, result);
@@ -2010,6 +2279,10 @@ class BunDebugAdapter {
 	async #rebindFunctionBreakpointsForLoadedScripts(): Promise<void> {
 		for (const entry of this.#functionBreakpoints) {
 			if (entry.entry?.verified) continue;
+			if (entry.entry?.inspectorId && !entry.entry.verified) {
+				this.#syncFunctionBreakpoint(entry);
+				continue;
+			}
 			if (entry.entry) {
 				await this.#tryRebindBreakpoint(entry.entry);
 				this.#syncFunctionBreakpoint(entry);
@@ -2066,13 +2339,21 @@ class BunDebugAdapter {
 		return { stackFrames: frames, totalFrames: this.#frames.length };
 	}
 
+	#scopeHandleFromScope(scope: InspectorScope, frame: InspectorCallFrame | undefined): VariableHandle {
+		return {
+			...this.#variableHandleFromRemoteObject(scope.object, frame?.callFrameId, true),
+			scopeName: scope.name,
+			scopeType: scope.type,
+		};
+	}
+
 	#scopes(args: DapBody): DapBody {
 		const frameId = numberArg(args.frameId);
 		const frame = frameId ? this.#frames[frameId - 1] : undefined;
 		return {
 			scopes: (frame?.scopeChain ?? []).map((scope) => ({
 				name: scope.name || scope.type,
-				variablesReference: this.#createVariableReference(this.#variableHandleFromRemoteObject(scope.object, frame?.callFrameId, true)),
+				variablesReference: this.#createVariableReference(this.#scopeHandleFromScope(scope, frame)),
 				expensive: scope.type === "global",
 			})),
 		};
@@ -2090,23 +2371,47 @@ class BunDebugAdapter {
 		const start = numberArg(args.start) ?? 0;
 		const count = numberArg(args.count);
 		const properties = result.properties ?? [];
-		const visible = count === undefined ? properties.slice(start) : properties.slice(start, start + count);
-		return {
-			variables: visible.map((property) => {
-				const value =
-					handle.subtype === "array" && property.name === "length" && property.value?.type === "number" && handle.size !== undefined
-						? { ...property.value, value: handle.size, description: String(handle.size) }
-						: property.value;
-				return {
-					name: property.name,
-					value: remoteObjectToString(value),
-					type: variableType(value),
-					variablesReference: value?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(value, handle.frameId)) : 0,
+		const variables =
+			properties.length === 0 && handle.isScope ? await this.#syntheticScopeVariables(handle) : this.#variablesFromProperties(properties, handle);
+		const visible = count === undefined ? variables.slice(start) : variables.slice(start, start + count);
+		return { variables: visible };
+	}
 
-					...(value && isArrayLikeRemoteObject(value) && value.size !== undefined ? { indexedVariables: value.size } : {}),
-				};
-			}),
+	#remoteObjectVariableData(value: InspectorRemoteObject | undefined, frameId: string | undefined): DapBody {
+		return {
+			value: remoteObjectToString(value),
+			type: variableType(value),
+			variablesReference: value?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(value, frameId)) : 0,
+			...(value && isArrayLikeRemoteObject(value) && value.size !== undefined ? { indexedVariables: value.size } : {}),
 		};
+	}
+
+	#variableFromRemoteObject(name: string, value: InspectorRemoteObject | undefined, frameId: string | undefined): DapBody {
+		return { name, ...this.#remoteObjectVariableData(value, frameId) };
+	}
+
+	#variablesFromProperties(properties: InspectorProperty[], handle: VariableHandle): DapBody[] {
+		return properties.map((property) => {
+			const value =
+				handle.subtype === "array" && property.name === "length" && property.value?.type === "number" && handle.size !== undefined
+					? { ...property.value, value: handle.size, description: String(handle.size) }
+					: property.value;
+			return this.#variableFromRemoteObject(property.name, value, handle.frameId);
+		});
+	}
+
+	async #syntheticScopeVariables(handle: VariableHandle): Promise<DapBody[]> {
+		if (handle.scopeName !== "globalLexicalEnvironment" && handle.scopeType !== "globalLexicalEnvironment") return [];
+		const frame = this.#frames.find((candidate) => candidate.callFrameId === handle.frameId);
+		const stop = this.#sourceStopLocation(frame);
+		const names = topLevelLexicalBindingNamesBeforeLine(stop?.sourcePath, stop?.line ?? 0);
+		const variables: DapBody[] = [];
+		for (const name of names) {
+			const value = await this.#evaluateExpression(name, handle.frameId, true).catch(() => undefined);
+			if (value?.type === "error" || value?.subtype === "error") continue;
+			variables.push(this.#variableFromRemoteObject(name, value, handle.frameId));
+		}
+		return variables;
 	}
 
 	async #setVariable(args: DapBody): Promise<DapBody> {
@@ -2178,12 +2483,7 @@ class BunDebugAdapter {
 	}
 
 	#variableResponseFromRemoteObject(value: InspectorRemoteObject | undefined, frameId: string | undefined): DapBody {
-		return {
-			value: remoteObjectToString(value),
-			type: variableType(value),
-			variablesReference: value?.objectId ? this.#createVariableReference(this.#variableHandleFromRemoteObject(value, frameId)) : 0,
-			...(value && isArrayLikeRemoteObject(value) && value.size !== undefined ? { indexedVariables: value.size } : {}),
-		};
+		return this.#remoteObjectVariableData(value, frameId);
 	}
 
 	async #evaluate(args: DapBody): Promise<DapBody> {
@@ -2331,6 +2631,24 @@ class BunDebugAdapter {
 		return reference;
 	}
 
+	#terminalStepStopShouldResume(frame: InspectorCallFrame | undefined): boolean {
+		const pending = this.#pendingTerminalSourceStep;
+		const stop = this.#sourceStopLocation(frame);
+		if (!pending || !stop?.sourcePath || !pathsLikelyMatch(stop.sourcePath, pending.sourcePath) || stop.line <= pending.line) return false;
+		const lines = sourceLines(stop.sourcePath);
+		return stop.line > lines.length || !isSourceStepCandidate(lines[stop.line - 1] ?? "");
+	}
+
+	#queueScriptRebind(task: () => Promise<void>): void {
+		const queued = this.#scriptRebindQueue.catch(() => undefined).then(task);
+		this.#scriptRebindQueue = queued;
+		void queued.catch(() => undefined);
+	}
+
+	async #awaitScriptRebindQueue(): Promise<void> {
+		await this.#scriptRebindQueue.catch(() => undefined);
+	}
+
 	#handleScriptParsed(params: unknown): void {
 		if (!isRecord(params) || typeof params.scriptId !== "string") return;
 		const scriptUrl = stringArg(params.url);
@@ -2345,8 +2663,10 @@ class BunDebugAdapter {
 		};
 		this.#scriptsById.set(script.scriptId, script);
 		if (script.url) this.#scriptsByUrl.set(script.url, script);
-		void this.#rebindBreakpointsForScript(script);
-		void this.#rebindFunctionBreakpointsForLoadedScripts();
+		this.#queueScriptRebind(async () => {
+			await this.#rebindBreakpointsForScript(script);
+			await this.#rebindFunctionBreakpointsForLoadedScripts();
+		});
 	}
 
 	#handleBreakpointResolved(params: unknown): void {
@@ -2369,10 +2689,6 @@ class BunDebugAdapter {
 
 	async #handlePaused(params: unknown): Promise<void> {
 		if (!isRecord(params)) return;
-		if (!this.#configurationDone && this.#suppressInitialPause) {
-			this.#deferredInitialPause = params;
-			return;
-		}
 		const frames = Array.isArray(params.callFrames)
 			? params.callFrames.filter((frame): frame is InspectorCallFrame => isRecord(frame) && typeof frame.callFrameId === "string")
 			: [];
@@ -2385,17 +2701,52 @@ class BunDebugAdapter {
 			await this.#handlePendingSourceMapPlaceholderPause(breakpointId, placeholder, frames[0]);
 			return;
 		}
+		const correctedHit = this.#pendingBreakpointCorrection;
+		this.#pendingBreakpointCorrection = undefined;
 		const locationEntries = frames[0] ? this.#breakpointEntriesForLocation(frames[0].location) : [];
 		const locationTemporaryHit = locationEntries.find((entry) => entry.inspectorId !== undefined && this.#temporaryBreakpointIds.has(entry.inspectorId));
-		const hit = breakpointId
+		const inspectorHit = breakpointId
 			? this.#breakpointsByInspectorId.get(breakpointId)
 			: locationEntries.find((entry) => entry !== locationTemporaryHit && entry.inspectorId !== undefined);
-		const temporaryStep = breakpointId ? this.#temporaryBreakpointIds.has(breakpointId) : locationTemporaryHit !== undefined;
+		const reason = stoppedReason(stringArg(params.reason));
+		if (reason !== "breakpoint" && this.#terminalStepStopShouldResume(frames[0])) {
+			await this.#requiredInspector().send("Debugger.resume");
+			return;
+		}
+		const sourceStop = frames[0] && reason === "breakpoint" ? this.#sourceStopLocation(frames[0]) : undefined;
+		const sourceHit =
+			inspectorHit ??
+			(sourceStop?.sourcePath
+				? this.#breakpointEntriesForSourceLine(sourceStop.sourcePath, sourceStop.line).find((entry) => entry !== locationTemporaryHit)
+				: undefined);
+		const hit = correctedHit ?? sourceHit;
+		const temporaryStep = correctedHit === undefined && (breakpointId ? this.#temporaryBreakpointIds.has(breakpointId) : locationTemporaryHit !== undefined);
 		const stepHit = temporaryStep ? (breakpointId ? hit : locationTemporaryHit) : undefined;
 		const pendingStep = this.#pendingStepLocationOverride;
+		const entryBreakpointId =
+			breakpointId && this.#entryBreakpointIds.has(breakpointId)
+				? breakpointId
+				: locationTemporaryHit?.inspectorId !== undefined && this.#entryBreakpointIds.has(locationTemporaryHit.inspectorId)
+					? locationTemporaryHit.inspectorId
+					: undefined;
+		const entryTarget = entryBreakpointId ? this.#entryBreakpointTargets.get(entryBreakpointId) : undefined;
+		const entryStop = entryTarget !== undefined;
+		if (entryStop && this.#suppressLaunchEntryStop && hit === undefined) {
+			await this.#awaitScriptRebindQueue();
+			await this.#rebindBreakpointsForLoadedScripts();
+			if (this.#temporaryBreakpointIds.size > 0) await this.#clearTemporaryStepBreakpoints();
+			if (this.#stepDisabledBreakpoints.length > 0) await this.#restoreStepDisabledBreakpoints();
+			await this.#requiredInspector().send("Debugger.resume");
+			return;
+		}
 		if (!temporaryStep && (await this.#continuePendingLoopSourceStep(frames[0]))) return;
 		if (!temporaryStep) this.#pendingLoopSourceStep = undefined;
 		if (hit && !temporaryStep && frames[0]) {
+			if (correctedHit === undefined && (await this.#breakpointStopNeedsLexicalCorrection(hit, frames[0]))) {
+				this.#pendingBreakpointCorrection = hit;
+				await this.#requiredInspector().send("Debugger.stepNext");
+				return;
+			}
 			this.#lastStepLocationOverride = {
 				scriptId: frames[0].location.scriptId,
 				lineNumber: frames[0].location.lineNumber,
@@ -2408,20 +2759,21 @@ class BunDebugAdapter {
 			this.#lastStepLocationOverride = {
 				scriptId: frames[0].location.scriptId,
 				lineNumber: frames[0].location.lineNumber,
-				sourcePath: stepHit?.sourceKey ?? pendingStep?.sourcePath ?? "",
-				line: stepHit?.request.line ?? pendingStep?.line ?? frames[0].location.lineNumber + 1,
-				column: stepHit?.request.column ?? pendingStep?.column ?? 1,
+				sourcePath: stepHit?.sourceKey ?? entryTarget?.sourcePath ?? pendingStep?.sourcePath ?? "",
+				line: stepHit?.request.line ?? entryTarget?.line ?? pendingStep?.line ?? frames[0].location.lineNumber + 1,
+				column: stepHit?.request.column ?? entryTarget?.column ?? pendingStep?.column ?? 1,
 			};
 		}
 		this.#pendingStepLocationOverride = undefined;
 		this.#pendingLoopSourceStep = undefined;
 		if (this.#temporaryBreakpointIds.size > 0) await this.#clearTemporaryStepBreakpoints();
 		if (this.#stepDisabledBreakpoints.length > 0) await this.#restoreStepDisabledBreakpoints();
+		const userBreakpointHit = hit !== undefined && (!temporaryStep || entryStop);
 		this.#sendEvent("stopped", {
-			reason: temporaryStep ? "step" : stoppedReason(stringArg(params.reason)),
+			reason: userBreakpointHit ? "breakpoint" : entryStop ? "entry" : temporaryStep ? "step" : reason,
 			threadId: THREAD_ID,
 			allThreadsStopped: true,
-			...(hit && !temporaryStep ? { hitBreakpointIds: [hit.dapId] } : {}),
+			...(userBreakpointHit ? { hitBreakpointIds: [hit.dapId] } : {}),
 		});
 	}
 
@@ -2458,6 +2810,18 @@ class BunDebugAdapter {
 				allThreadsStopped: true,
 				hitBreakpointIds: [entry.dapId],
 			});
+			return;
+		}
+		const stop = this.#sourceStopLocation(frame);
+		if (
+			stop?.sourcePath &&
+			pathsLikelyMatch(stop.sourcePath, entry.sourceKey) &&
+			stop.line === entry.request.line - 1 &&
+			!entry.request.condition &&
+			!entry.request.hitCondition
+		) {
+			this.#pendingBreakpointCorrection = entry;
+			await inspector.send("Debugger.stepNext").catch(() => undefined);
 			return;
 		}
 		await inspector.send("Debugger.resume").catch(() => undefined);
