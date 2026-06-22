@@ -2004,14 +2004,19 @@ class BunDebugAdapter {
 		}
 	}
 
-	async #setTemporaryStepBreakpointBySource(sourcePath: string, line: number): Promise<boolean> {
+	async #setInspectorBreakpointBySource(sourcePath: string, line: number): Promise<string | undefined> {
 		const result = await this.#requiredInspector().send<InspectorSetBreakpointResult>("Debugger.setBreakpointByUrl", {
 			url: inspectorUrlForSource(sourcePath),
 			lineNumber: Math.max(line - 1, 0),
 			columnNumber: defaultColumnForSourceLine(sourcePath, line),
 		});
-		if (!result.breakpointId) return false;
-		this.#temporaryBreakpointIds.add(result.breakpointId);
+		return result.breakpointId;
+	}
+
+	async #setTemporaryStepBreakpointBySource(sourcePath: string, line: number): Promise<boolean> {
+		const breakpointId = await this.#setInspectorBreakpointBySource(sourcePath, line);
+		if (!breakpointId) return false;
+		this.#temporaryBreakpointIds.add(breakpointId);
 		return true;
 	}
 
@@ -2043,17 +2048,11 @@ class BunDebugAdapter {
 	}
 
 	async #setTemporaryEntryBreakpointBySource(sourcePath: string, line: number): Promise<void> {
-		const result = await this.#requiredInspector()
-			.send<InspectorSetBreakpointResult>("Debugger.setBreakpointByUrl", {
-				url: inspectorUrlForSource(sourcePath),
-				lineNumber: Math.max(line - 1, 0),
-				columnNumber: defaultColumnForSourceLine(sourcePath, line),
-			})
-			.catch(() => undefined);
-		if (!result?.breakpointId) return;
-		this.#temporaryBreakpointIds.add(result.breakpointId);
-		this.#entryBreakpointIds.add(result.breakpointId);
-		this.#entryBreakpointTargets.set(result.breakpointId, { sourcePath, line, column: defaultColumnForSourceLine(sourcePath, line) + 1 });
+		const breakpointId = await this.#setInspectorBreakpointBySource(sourcePath, line).catch(() => undefined);
+		if (!breakpointId) return;
+		this.#temporaryBreakpointIds.add(breakpointId);
+		this.#entryBreakpointIds.add(breakpointId);
+		this.#entryBreakpointTargets.set(breakpointId, { sourcePath, line, column: defaultColumnForSourceLine(sourcePath, line) + 1 });
 	}
 
 	async #installLaunchEntryBreakpoints(): Promise<void> {
