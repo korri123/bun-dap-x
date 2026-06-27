@@ -2,6 +2,14 @@
 
 All notable changes are managed by release-please from Conventional Commit history.
 
+## [0.2.4](https://github.com/korri123/bun-dap-x/compare/v0.2.3...v0.2.4) (2026-06-22)
+
+
+### Bug Fixes
+
+* bun bug workarounds ([f4ba946](https://github.com/korri123/bun-dap-x/commit/f4ba9468e78bb5b6067401277dadbb646256616b))
+* jscpd ([18ad526](https://github.com/korri123/bun-dap-x/commit/18ad52627af7ab6f19bd623e4bfaa5a4897741d2))
+
 ## [0.2.3](https://github.com/korri123/bun-dap-x/compare/v0.2.2...v0.2.3) (2026-06-21)
 
 
